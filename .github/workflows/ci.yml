@@ -17,6 +17,6 @@ jobs:
           cache: true
       - run: go mod download
       - run: go test -race -cover ./...
-      - uses: golangci/golangci-lint-action@v4
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: latest
