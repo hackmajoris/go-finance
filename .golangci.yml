@@ -1,18 +1,22 @@
+version: "2"
+
 linters:
   enable:
     - errcheck
     - govet
     - staticcheck
-    - gosimple
     - unused
-    - gofmt
-    - goimports
     - misspell
     - revive
 
-linters-settings:
-  goimports:
-    local-prefixes: github.com/hackmajoris/go-finance
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/hackmajoris/go-finance
 
 issues:
   exclude-use-default: false
