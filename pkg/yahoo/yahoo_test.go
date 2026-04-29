@@ -49,7 +49,7 @@ func TestGetQuote(t *testing.T) {
 	}{
 		{
 			name: "happy path stock",
-			handler: func(w http.ResponseWriter, r *http.Request) {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(w).Encode(quotePayload("AAPL", 189.43, "USD"))
 			},
 			ticker:     "AAPL",
@@ -59,7 +59,7 @@ func TestGetQuote(t *testing.T) {
 		},
 		{
 			name: "happy path crypto",
-			handler: func(w http.ResponseWriter, r *http.Request) {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(w).Encode(quotePayload("BTC-USD", 94234.56, "USD"))
 			},
 			ticker:     "BTC-USD",
@@ -69,7 +69,7 @@ func TestGetQuote(t *testing.T) {
 		},
 		{
 			name: "ticker not found — empty result",
-			handler: func(w http.ResponseWriter, r *http.Request) {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(w).Encode(map[string]interface{}{
 					"quoteResponse": map[string]interface{}{
 						"result": []interface{}{},
@@ -114,7 +114,7 @@ func TestGetQuote(t *testing.T) {
 		},
 		{
 			name: "http error status",
-			handler: func(w http.ResponseWriter, r *http.Request) {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusInternalServerError)
 			},
 			ticker:  "AAPL",
@@ -122,7 +122,7 @@ func TestGetQuote(t *testing.T) {
 		},
 		{
 			name: "malformed json",
-			handler: func(w http.ResponseWriter, r *http.Request) {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write([]byte("{not valid json"))
 			},
 			ticker:     "AAPL",

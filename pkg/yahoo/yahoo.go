@@ -1,3 +1,4 @@
+// Package yahoo provides a client for fetching quotes from Yahoo Finance.
 package yahoo
 
 import (
@@ -13,6 +14,8 @@ import (
 	"strings"
 )
 
+// ErrTickerNotFound is returned when the requested symbol has no results.
+// ErrAPIError is returned when Yahoo Finance responds with an error.
 var (
 	ErrTickerNotFound = errors.New("ticker not found")
 	ErrAPIError       = errors.New("yahoo finance api error")
@@ -27,8 +30,10 @@ const (
 var reCRSF = regexp.MustCompile(`csrfToken" value="([^"]+)"`)
 var reForexPair = regexp.MustCompile(`^([A-Z]{3})-([A-Z]{3})$`)
 
+// Option configures a Client.
 type Option func(*Client)
 
+// Client fetches quotes from Yahoo Finance.
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
@@ -36,12 +41,14 @@ type Client struct {
 	crumb      string
 }
 
+// Quote holds the price data returned for a symbol.
 type Quote struct {
 	Symbol   string  `json:"symbol"`
 	Price    float64 `json:"price"`
 	Currency string  `json:"currency"`
 }
 
+// New creates a Client with a cookie jar and optional overrides.
 func New(opts ...Option) (*Client, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -58,18 +65,22 @@ func New(opts ...Option) (*Client, error) {
 	return c, nil
 }
 
+// WithHTTPClient overrides the default HTTP client.
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) { c.httpClient = hc }
 }
 
+// WithBaseURL overrides the Yahoo Finance API base URL.
 func WithBaseURL(u string) Option {
 	return func(c *Client) { c.baseURL = u }
 }
 
+// WithCrumbURL overrides the crumb endpoint URL.
 func WithCrumbURL(u string) Option {
 	return func(c *Client) { c.crumbURL = u }
 }
 
+// WithCrumb injects a pre-fetched crumb, skipping the consent flow.
 func WithCrumb(crumb string) Option {
 	return func(c *Client) { c.crumb = crumb }
 }
@@ -94,7 +105,7 @@ func (c *Client) fetchCrumb(ctx context.Context) error {
 	}
 	finalURL := resp.Request.URL.String()
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Step 2: if we landed on the consent page, accept it
 	if strings.Contains(finalURL, "consent.yahoo.com") {
@@ -141,7 +152,7 @@ func (c *Client) acceptConsent(ctx context.Context, consentPageURL, html string)
 	if err != nil {
 		return fmt.Errorf("posting consent: %w", err)
 	}
-	postResp.Body.Close()
+	_ = postResp.Body.Close()
 	return nil
 }
 
@@ -156,7 +167,7 @@ func (c *Client) doFetchCrumb(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fetching crumb: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%w: crumb status %d", ErrAPIError, resp.StatusCode)
@@ -170,6 +181,7 @@ func (c *Client) doFetchCrumb(ctx context.Context) error {
 	return nil
 }
 
+// GetQuote returns the current price for a ticker. Forex pairs like "USD-EUR" are resolved automatically.
 func (c *Client) GetQuote(ctx context.Context, ticker string) (*Quote, error) {
 	if c.crumb == "" {
 		if err := c.fetchCrumb(ctx); err != nil {
@@ -220,7 +232,7 @@ func (c *Client) doGetQuote(ctx context.Context, symbol string) (*Quote, error) 
 	if err != nil {
 		return nil, fmt.Errorf("executing request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)

@@ -16,7 +16,8 @@ test:
 	go test -race -cover ./...
 
 lint:
-	golangci-lint run ./...
+	@which golangci-lint > /dev/null 2>&1 || go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	golangci-lint run --fix ./...
 
 fmt:
 	gofmt -w .

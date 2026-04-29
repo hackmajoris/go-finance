@@ -1,3 +1,4 @@
+// Package example demonstrates the standard package structure.
 package example
 
 // Client is the main type for this package.

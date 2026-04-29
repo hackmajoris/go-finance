@@ -1,3 +1,4 @@
+// Package main is the entry point for the go-finance CLI.
 package main
 
 import (

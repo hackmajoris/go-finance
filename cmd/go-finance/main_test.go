@@ -11,7 +11,7 @@ import (
 
 func startMockServer(t *testing.T, symbol string, price float64, currency string) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"quoteResponse": map[string]interface{}{
 				"result": []map[string]interface{}{
@@ -32,8 +32,8 @@ func TestRun(t *testing.T) {
 		wantOutput string
 	}{
 		{
-			name: "missing ticker arg",
-			args: nil,
+			name:    "missing ticker arg",
+			args:    nil,
 			wantErr: "usage: go-finance <TICKER>",
 		},
 		{

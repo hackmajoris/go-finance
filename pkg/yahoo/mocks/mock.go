@@ -1,3 +1,4 @@
+// Package mocks provides test doubles for the yahoo package.
 package mocks
 
 import (
@@ -16,6 +17,7 @@ type MockQuoter struct {
 	QuoteFn func(ctx context.Context, ticker string) (*yahoo.Quote, error)
 }
 
+// GetQuote delegates to QuoteFn.
 func (m *MockQuoter) GetQuote(ctx context.Context, ticker string) (*yahoo.Quote, error) {
 	return m.QuoteFn(ctx, ticker)
 }
