@@ -18,5 +18,3 @@ formatters:
       local-prefixes:
         - github.com/hackmajoris/go-finance
 
-issues:
-  exclude-use-default: false
