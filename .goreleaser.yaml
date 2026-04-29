@@ -1,5 +1,3 @@
-version: 2
-
 builds:
   - main: ./cmd/go-finance
     binary: go-finance
