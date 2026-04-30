@@ -26,6 +26,9 @@ make run ARGS="AAPL --year 2024 --month 3"
 
 # Yearly price (aggregated from quarterly data)
 make run ARGS="AAPL --year 2024"
+
+# Yearly price for a currency pair
+make run ARGS="USD-RON --year 2015"
 ```
 
 ### Output examples
@@ -43,6 +46,11 @@ make run ARGS="AAPL --year 2024"
 **Yearly (`--year 2024`)**
 ```json
 {"symbol":"AAPL","year":2024,"open":187.15,"high":237.49,"low":164.08,"close":225.91,"avg":203.66}
+```
+
+**Yearly — currency pair (`USD-RON --year 2015`)**
+```json
+{"symbol":"USD-RON","year":2015,"open":3.7029,"high":4.1851,"low":3.7029,"close":4.0333,"avg":3.9061}
 ```
 
 ### Flags
@@ -97,12 +105,19 @@ func main() {
         log.Fatal(err)
     }
     fmt.Println(yearly.Open, yearly.High, yearly.Low, yearly.Close, yearly.Avg)
+
+    // Yearly OHLC for a currency pair
+    forexYearly, err := client.GetYearlyBar(context.Background(), "USD-RON", 2015)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(forexYearly.Open, forexYearly.High, forexYearly.Low, forexYearly.Close, forexYearly.Avg)
 }
 ```
 
 `GetQuote` accepts any Yahoo Finance symbol — stocks (`AAPL`), crypto (`BTC-USD`), and currency pairs (`USD-EUR`, `RON-USD`).
 
-`GetMonthlyBar` and `GetYearlyBar` currently support stock and crypto symbols. Forex pairs are not supported by the Yahoo Finance chart endpoint.
+`GetMonthlyBar` and `GetYearlyBar` accept any Yahoo Finance symbol — stocks (`AAPL`), crypto (`BTC-USD`), and currency pairs (`USD-RON`).
 
 ## Development
 
