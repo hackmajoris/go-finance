@@ -12,13 +12,16 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // ErrTickerNotFound is returned when the requested symbol has no results.
 // ErrAPIError is returned when Yahoo Finance responds with an error.
+// ErrNoData is returned when Yahoo Finance has no data for the requested period.
 var (
 	ErrTickerNotFound = errors.New("ticker not found")
 	ErrAPIError       = errors.New("yahoo finance api error")
+	ErrNoData         = errors.New("no data available for the requested period")
 )
 
 const (
@@ -46,6 +49,29 @@ type Quote struct {
 	Symbol   string  `json:"symbol"`
 	Price    float64 `json:"price"`
 	Currency string  `json:"currency"`
+}
+
+// HistoricalBar holds monthly OHLC data for a symbol.
+type HistoricalBar struct {
+	Symbol string  `json:"symbol"`
+	Year   int     `json:"year"`
+	Month  int     `json:"month"`
+	Open   float64 `json:"open"`
+	High   float64 `json:"high"`
+	Low    float64 `json:"low"`
+	Close  float64 `json:"close"`
+	Avg    float64 `json:"avg"`
+}
+
+// YearlyBar holds yearly OHLC data aggregated from quarterly data.
+type YearlyBar struct {
+	Symbol string  `json:"symbol"`
+	Year   int     `json:"year"`
+	Open   float64 `json:"open"`
+	High   float64 `json:"high"`
+	Low    float64 `json:"low"`
+	Close  float64 `json:"close"`
+	Avg    float64 `json:"avg"`
 }
 
 // New creates a Client with a cookie jar and optional overrides.
@@ -266,5 +292,201 @@ func (c *Client) doGetQuote(ctx context.Context, symbol string) (*Quote, error) 
 		Symbol:   r.Symbol,
 		Price:    r.RegularMarketPrice,
 		Currency: r.Currency,
+	}, nil
+}
+
+// GetMonthlyBar returns the OHLC data for a symbol in a given month. Forex pairs like "USD-EUR" are resolved automatically.
+func (c *Client) GetMonthlyBar(ctx context.Context, ticker string, year, month int) (*HistoricalBar, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	bar, err := c.doGetMonthlyBar(ctx, ticker, year, month)
+	if err != nil {
+		return nil, err
+	}
+
+	// Attempt forex pair format for unrecognized symbols.
+	if (bar == nil || bar.Close == 0) && reForexPair.MatchString(ticker) {
+		m := reForexPair.FindStringSubmatch(ticker)
+		bar, err = c.doGetMonthlyBar(ctx, m[1]+m[2]+"=X", year, month)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if bar == nil || bar.Close == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+
+	bar.Symbol = ticker
+	return bar, nil
+}
+
+func (c *Client) doGetMonthlyBar(ctx context.Context, symbol string, year, month int) (*HistoricalBar, error) {
+	// Calculate period1 (first second of the month) and period2 (first second of next month)
+	period1 := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC).Unix()
+	period2 := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0).Unix()
+
+	u, err := url.Parse(fmt.Sprintf("%s/v7/finance/chart/%s", c.baseURL, symbol))
+	if err != nil {
+		return nil, fmt.Errorf("parsing url: %w", err)
+	}
+	q := u.Query()
+	q.Set("interval", "1mo")
+	q.Set("period1", fmt.Sprintf("%d", period1))
+	q.Set("period2", fmt.Sprintf("%d", period2))
+	q.Set("crumb", c.crumb)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode == http.StatusBadRequest {
+		var errBody struct {
+			Chart struct {
+				Error struct {
+					Description string `json:"description"`
+				} `json:"error"`
+			} `json:"chart"`
+		}
+		if jsonErr := json.NewDecoder(resp.Body).Decode(&errBody); jsonErr == nil && errBody.Chart.Error.Description != "" {
+			return nil, fmt.Errorf("%w: %s", ErrNoData, errBody.Chart.Error.Description)
+		}
+		return nil, ErrNoData
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)
+	}
+
+	var payload struct {
+		Chart struct {
+			Result []struct {
+				Indicators struct {
+					Quote []struct {
+						Open  []float64 `json:"open"`
+						High  []float64 `json:"high"`
+						Low   []float64 `json:"low"`
+						Close []float64 `json:"close"`
+					} `json:"quote"`
+				} `json:"indicators"`
+			} `json:"result"`
+			Error interface{} `json:"error"`
+		} `json:"chart"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+
+	if payload.Chart.Error != nil {
+		return nil, fmt.Errorf("%w: %v", ErrAPIError, payload.Chart.Error)
+	}
+
+	if len(payload.Chart.Result) == 0 || len(payload.Chart.Result[0].Indicators.Quote) == 0 || len(payload.Chart.Result[0].Indicators.Quote[0].Close) == 0 {
+		return nil, nil
+	}
+
+	quote := payload.Chart.Result[0].Indicators.Quote[0]
+	open := quote.Open[0]
+	high := quote.High[0]
+	low := quote.Low[0]
+	closePrice := quote.Close[0]
+	avg := (open + high + low + closePrice) / 4
+
+	return &HistoricalBar{
+		Year:  year,
+		Month: month,
+		Open:  open,
+		High:  high,
+		Low:   low,
+		Close: closePrice,
+		Avg:   avg,
+	}, nil
+}
+
+// GetYearlyBar returns yearly OHLC data by aggregating 4 quarters. Forex pairs like "USD-EUR" are resolved automatically.
+func (c *Client) GetYearlyBar(ctx context.Context, ticker string, year int) (*YearlyBar, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	bar, err := c.doGetYearlyBar(ctx, ticker, year)
+	if err != nil {
+		return nil, err
+	}
+
+	// Attempt forex pair format for unrecognized symbols.
+	if (bar == nil || bar.Close == 0) && reForexPair.MatchString(ticker) {
+		m := reForexPair.FindStringSubmatch(ticker)
+		bar, err = c.doGetYearlyBar(ctx, m[1]+m[2]+"=X", year)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if bar == nil || bar.Close == 0 {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+
+	bar.Symbol = ticker
+	return bar, nil
+}
+
+func (c *Client) doGetYearlyBar(ctx context.Context, symbol string, year int) (*YearlyBar, error) {
+	// Fetch 4 quarters and aggregate
+	quarters := make([]*HistoricalBar, 4)
+	for q := 0; q < 4; q++ {
+		month := q*3 + 1
+		bar, err := c.doGetMonthlyBar(ctx, symbol, year, month)
+		if err != nil {
+			return nil, err
+		}
+		if bar == nil {
+			return nil, nil
+		}
+		quarters[q] = bar
+	}
+
+	// Aggregate: open from Q1, close from Q4, high/low from all
+	open := quarters[0].Open
+	closePrice := quarters[3].Close
+	high := quarters[0].High
+	low := quarters[0].Low
+
+	for _, q := range quarters {
+		if q.High > high {
+			high = q.High
+		}
+		if q.Low < low {
+			low = q.Low
+		}
+	}
+
+	avg := (open + high + low + closePrice) / 4
+
+	return &YearlyBar{
+		Year:  year,
+		Open:  open,
+		High:  high,
+		Low:   low,
+		Close: closePrice,
+		Avg:   avg,
 	}, nil
 }

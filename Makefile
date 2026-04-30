@@ -7,10 +7,7 @@ build:
 	go build -ldflags="-s -w" -o $(BIN) ./cmd/$(APP)
 
 run: build
-	$(BIN) $(filter-out $@,$(MAKECMDGOALS))
-
-%:
-	@:
+	$(BIN) $(ARGS)
 
 test:
 	go test -race -cover ./...
@@ -22,6 +19,7 @@ lint:
 	golangci-lint run --fix ./...
 
 fmt:
+	@which goimports > /dev/null 2>&1 || go install golang.org/x/tools/cmd/goimports@latest
 	gofmt -w .
 	goimports -w .
 

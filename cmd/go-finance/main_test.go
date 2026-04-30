@@ -37,6 +37,16 @@ func TestRun(t *testing.T) {
 			wantErr: "usage: go-finance <TICKER>",
 		},
 		{
+			name:    "month without year",
+			args:    []string{"AAPL", "--month", "3"},
+			wantErr: "usage: go-finance <TICKER>",
+		},
+		{
+			name:    "unknown flag",
+			args:    []string{"AAPL", "--foo"},
+			wantErr: "unknown flag: --foo",
+		},
+		{
 			name: "successful quote",
 			args: []string{"AAPL"},
 			setup: func(t *testing.T) *httptest.Server {
