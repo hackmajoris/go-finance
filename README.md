@@ -85,29 +85,48 @@ func main() {
         log.Fatal(err)
     }
 
-    // Current price
-    quote, err := client.GetQuote(context.Background(), "USD-EUR")
+    ctx := context.Background()
+
+    // Current price — single symbol
+    quote, err := client.GetQuote(ctx, "USD-EUR")
     if err != nil {
         log.Fatal(err)
     }
     fmt.Println(quote.Symbol, quote.Price, quote.Currency)
 
+    // Current prices — multiple symbols in parallel (returns map[symbol]price)
+    prices, err := client.FetchQuotes(ctx, []string{"AAPL", "BTC-USD", "BRK B"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(prices["AAPL"], prices["BTC-USD"], prices["BRK-B"])
+
+    // FX rates relative to a base currency — fetched in parallel
+    rates, err := client.FetchFXRates(ctx, []string{"EUR", "RON", "USD"}, "USD")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(rates["EUR"], rates["RON"]) // rates["USD"] == 1.0
+
+    // Normalize broker tickers to Yahoo Finance format ("BRK B" → "BRK-B")
+    fmt.Println(yahoo.NormalizeTicker("BRK B"))
+
     // Monthly OHLC
-    bar, err := client.GetMonthlyBar(context.Background(), "AAPL", 2024, 3)
+    bar, err := client.GetMonthlyBar(ctx, "AAPL", 2024, 3)
     if err != nil {
         log.Fatal(err)
     }
     fmt.Println(bar.Open, bar.High, bar.Low, bar.Close, bar.Avg)
 
     // Yearly OHLC (aggregated from 4 quarters)
-    yearly, err := client.GetYearlyBar(context.Background(), "AAPL", 2024)
+    yearly, err := client.GetYearlyBar(ctx, "AAPL", 2024)
     if err != nil {
         log.Fatal(err)
     }
     fmt.Println(yearly.Open, yearly.High, yearly.Low, yearly.Close, yearly.Avg)
 
     // Yearly OHLC for a currency pair
-    forexYearly, err := client.GetYearlyBar(context.Background(), "USD-RON", 2015)
+    forexYearly, err := client.GetYearlyBar(ctx, "USD-RON", 2015)
     if err != nil {
         log.Fatal(err)
     }
@@ -117,9 +136,15 @@ func main() {
 
 `GetQuote` accepts any Yahoo Finance symbol — stocks (`AAPL`), crypto (`BTC-USD`), and currency pairs (`USD-EUR`, `RON-USD`).
 
+`FetchQuotes` fetches multiple symbols in parallel via the v8 chart endpoint (no crumb required) and returns a `map[string]float64`. Both the original ticker and its normalized form (e.g. `"BRK B"` and `"BRK-B"`) are stored in the map.
+
+`FetchFXRates` fetches spot rates for a list of currencies relative to a base currency in parallel. The base currency always gets rate `1.0`.
+
+`NormalizeTicker` converts broker-style tickers to Yahoo Finance format (spaces → hyphens).
+
 `GetMonthlyBar` and `GetYearlyBar` accept any Yahoo Finance symbol — stocks (`AAPL`), crypto (`BTC-USD`), and currency pairs (`USD-RON`).
 
-## Development
+## Development(examples)
 
 ```bash
 make build                          # compile binary to .bin/go-finance

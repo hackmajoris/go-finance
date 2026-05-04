@@ -12,16 +12,17 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// ErrTickerNotFound is returned when the requested symbol has no results.
-// ErrAPIError is returned when Yahoo Finance responds with an error.
-// ErrNoData is returned when Yahoo Finance has no data for the requested period.
 var (
+	// ErrTickerNotFound is returned when the requested symbol has no results on Yahoo Finance.
 	ErrTickerNotFound = errors.New("ticker not found")
-	ErrAPIError       = errors.New("yahoo finance api error")
-	ErrNoData         = errors.New("no data available for the requested period")
+	// ErrAPIError is returned when Yahoo Finance responds with a non-200 status or an API-level error.
+	ErrAPIError = errors.New("yahoo finance api error")
+	// ErrNoData is returned when Yahoo Finance has no data for the requested period (e.g. future dates or delisted symbols).
+	ErrNoData = errors.New("no data available for the requested period")
 )
 
 const (
@@ -33,10 +34,12 @@ const (
 var reCRSF = regexp.MustCompile(`csrfToken" value="([^"]+)"`)
 var reForexPair = regexp.MustCompile(`^([A-Z]{3})-([A-Z]{3})$`)
 
-// Option configures a Client.
+// Option is a functional option for configuring a Client.
 type Option func(*Client)
 
-// Client fetches quotes from Yahoo Finance.
+// Client fetches real-time and historical quotes from Yahoo Finance.
+// Use New to create a Client; it handles the session cookie and crumb
+// handshake required by the Yahoo Finance API automatically.
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
@@ -44,34 +47,37 @@ type Client struct {
 	crumb      string
 }
 
-// Quote holds the price data returned for a symbol.
+// Quote holds the current price data returned for a single symbol.
 type Quote struct {
-	Symbol   string  `json:"symbol"`
-	Price    float64 `json:"price"`
-	Currency string  `json:"currency"`
+	Symbol   string  `json:"symbol"`   // Yahoo Finance ticker (e.g. "AAPL", "BTC-USD", "USD-EUR")
+	Price    float64 `json:"price"`    // Regular market price
+	Currency string  `json:"currency"` // ISO 4217 currency code (e.g. "USD", "EUR")
 }
 
-// HistoricalBar holds monthly OHLC data for a symbol.
+// HistoricalBar holds OHLC price data for a single calendar month.
+// Avg is the simple average of Open, High, Low, and Close.
 type HistoricalBar struct {
-	Symbol string  `json:"symbol"`
-	Year   int     `json:"year"`
-	Month  int     `json:"month"`
+	Symbol string  `json:"symbol"` // Yahoo Finance ticker
+	Year   int     `json:"year"`   // Calendar year (e.g. 2024)
+	Month  int     `json:"month"`  // Calendar month (1–12)
 	Open   float64 `json:"open"`
 	High   float64 `json:"high"`
 	Low    float64 `json:"low"`
 	Close  float64 `json:"close"`
-	Avg    float64 `json:"avg"`
+	Avg    float64 `json:"avg"` // (Open + High + Low + Close) / 4
 }
 
-// YearlyBar holds yearly OHLC data aggregated from quarterly data.
+// YearlyBar holds OHLC price data aggregated across a full calendar year.
+// Open comes from Q1, Close from Q4, High and Low are the extremes across all four quarters.
+// Avg is the simple average of Open, High, Low, and Close.
 type YearlyBar struct {
-	Symbol string  `json:"symbol"`
-	Year   int     `json:"year"`
+	Symbol string  `json:"symbol"` // Yahoo Finance ticker
+	Year   int     `json:"year"`   // Calendar year (e.g. 2024)
 	Open   float64 `json:"open"`
 	High   float64 `json:"high"`
 	Low    float64 `json:"low"`
 	Close  float64 `json:"close"`
-	Avg    float64 `json:"avg"`
+	Avg    float64 `json:"avg"` // (Open + High + Low + Close) / 4
 }
 
 // New creates a Client with a cookie jar and optional overrides.
@@ -489,4 +495,145 @@ func (c *Client) doGetYearlyBar(ctx context.Context, symbol string, year int) (*
 		Close: closePrice,
 		Avg:   avg,
 	}, nil
+}
+
+// NormalizeTicker converts broker tickers to Yahoo Finance format.
+// e.g. "BRK B" → "BRK-B"
+func NormalizeTicker(sym string) string {
+	return strings.ReplaceAll(sym, " ", "-")
+}
+
+// FetchQuotes returns a map of symbol → current price for each symbol in the list,
+// fetching in parallel via the v8 chart endpoint (no crumb required).
+// Both the original and normalized ticker are stored in the result map.
+// Partial results are returned when only some fetches fail.
+func (c *Client) FetchQuotes(ctx context.Context, symbols []string) (map[string]float64, error) {
+	type result struct {
+		sym   string
+		price float64
+		err   error
+	}
+
+	ch := make(chan result, len(symbols))
+	var wg sync.WaitGroup
+
+	for _, sym := range symbols {
+		wg.Add(1)
+		go func(sym string) {
+			defer wg.Done()
+			price, err := c.fetchOneChart(ctx, NormalizeTicker(sym))
+			ch <- result{sym, price, err}
+		}(sym)
+	}
+
+	wg.Wait()
+	close(ch)
+
+	out := make(map[string]float64, len(symbols))
+	var errs []string
+	for r := range ch {
+		if r.err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", r.sym, r.err))
+			continue
+		}
+		out[r.sym] = r.price
+		out[NormalizeTicker(r.sym)] = r.price
+	}
+
+	if len(errs) > 0 && len(out) == 0 {
+		return nil, fmt.Errorf("all price fetches failed: %s", strings.Join(errs[:min(3, len(errs))], "; "))
+	}
+	return out, nil
+}
+
+// FetchFXRates returns spot rates for each currency relative to base (e.g. "USD"),
+// fetching in parallel via the v8 chart endpoint. The base currency always gets rate 1.0.
+// Partial results are returned when only some fetches fail.
+func (c *Client) FetchFXRates(ctx context.Context, currencies []string, base string) (map[string]float64, error) {
+	rates := map[string]float64{base: 1.0}
+	var toFetch []string
+	for _, cur := range currencies {
+		if cur != "" && cur != base {
+			toFetch = append(toFetch, cur)
+		}
+	}
+	if len(toFetch) == 0 {
+		return rates, nil
+	}
+
+	type result struct {
+		currency string
+		rate     float64
+		err      error
+	}
+	ch := make(chan result, len(toFetch))
+	var wg sync.WaitGroup
+
+	for _, cur := range toFetch {
+		wg.Add(1)
+		go func(cur string) {
+			defer wg.Done()
+			rate, err := c.fetchOneChart(ctx, cur+base+"=X")
+			ch <- result{cur, rate, err}
+		}(cur)
+	}
+	wg.Wait()
+	close(ch)
+
+	var errs []string
+	for r := range ch {
+		if r.err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", r.currency, r.err))
+			continue
+		}
+		rates[r.currency] = r.rate
+	}
+	if len(errs) > 0 && len(rates) == 1 {
+		return nil, fmt.Errorf("all FX fetches failed: %s", strings.Join(errs, "; "))
+	}
+	return rates, nil
+}
+
+type chartResponse struct {
+	Chart struct {
+		Result []struct {
+			Meta struct {
+				RegularMarketPrice float64 `json:"regularMarketPrice"`
+			} `json:"meta"`
+		} `json:"result"`
+		Error interface{} `json:"error"`
+	} `json:"chart"`
+}
+
+func (c *Client) fetchOneChart(ctx context.Context, symbol string) (float64, error) {
+	rawURL := fmt.Sprintf("https://query1.finance.yahoo.com/v8/finance/chart/%s?interval=1d&range=1d", symbol)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("%w: HTTP %d", ErrAPIError, resp.StatusCode)
+	}
+
+	var cr chartResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		return 0, err
+	}
+	if len(cr.Chart.Result) == 0 {
+		return 0, fmt.Errorf("%w: %s", ErrTickerNotFound, symbol)
+	}
+	price := cr.Chart.Result[0].Meta.RegularMarketPrice
+	if price == 0 {
+		return 0, fmt.Errorf("%w: %s", ErrTickerNotFound, symbol)
+	}
+	return price, nil
 }
