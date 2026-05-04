@@ -1,6 +1,6 @@
 # go-finance
 
-Fetches real-time and historical stock, crypto, and currency prices from Yahoo Finance and returns JSON output.
+Fetches real-time and historical stock, crypto, and currency prices from Yahoo Finance.
 
 ```json
 {"symbol":"AAPL","price":270.17,"currency":"USD"}
@@ -65,8 +65,10 @@ Flags may appear before or after the ticker: `go-finance AAPL --year 2024` and `
 ## Using the package in another Go app
 
 ```bash
-go get github.com/hackmajoris/go-finance@v0.1.0
+go get github.com/hackmajoris/go-finance@v0.1.3
 ```
+
+### Quick start
 
 ```go
 package main
@@ -134,17 +136,143 @@ func main() {
 }
 ```
 
-`GetQuote` accepts any Yahoo Finance symbol — stocks (`AAPL`), crypto (`BTC-USD`), and currency pairs (`USD-EUR`, `RON-USD`).
+## API Reference
 
-`FetchQuotes` fetches multiple symbols in parallel via the v8 chart endpoint (no crumb required) and returns a `map[string]float64`. Both the original ticker and its normalized form (e.g. `"BRK B"` and `"BRK-B"`) are stored in the map.
+### Creating a client
 
-`FetchFXRates` fetches spot rates for a list of currencies relative to a base currency in parallel. The base currency always gets rate `1.0`.
+```go
+client, err := yahoo.New()                         // default — auto-fetches crumb & cookie
+client, err := yahoo.New(yahoo.WithCrumb("abc123")) // inject a pre-fetched crumb
+client, err := yahoo.New(yahoo.WithHTTPClient(hc))  // bring your own http.Client
+```
 
-`NormalizeTicker` converts broker-style tickers to Yahoo Finance format (spaces → hyphens).
+`New` initialises a cookie jar, performs the Yahoo Finance consent flow, and fetches an API crumb. All options are optional.
 
-`GetMonthlyBar` and `GetYearlyBar` accept any Yahoo Finance symbol — stocks (`AAPL`), crypto (`BTC-USD`), and currency pairs (`USD-RON`).
+#### Options
 
-## Development(examples)
+| Option | Description |
+|--------|-------------|
+| `WithHTTPClient(hc *http.Client)` | Replace the default HTTP client (e.g. to set timeouts or a proxy). |
+| `WithBaseURL(u string)` | Override the Yahoo Finance API base URL (useful for testing). |
+| `WithCrumbURL(u string)` | Override the crumb endpoint URL. |
+| `WithCrumb(crumb string)` | Inject a pre-fetched crumb, skipping the consent/crumb-fetch flow. |
+
+### Methods
+
+#### `GetQuote(ctx, ticker) (*Quote, error)`
+
+Returns the current price for a symbol.
+
+```go
+quote, err := client.GetQuote(ctx, "AAPL")
+// quote.Symbol   → "AAPL"
+// quote.Price    → 270.17
+// quote.Currency → "USD"
+```
+
+Accepts stocks (`AAPL`), crypto (`BTC-USD`), and currency pairs (`USD-EUR`, `RON-USD`). Forex pairs are resolved to the Yahoo Finance `=X` suffix automatically.
+
+#### `FetchQuotes(ctx, symbols) (map[string]float64, error)`
+
+Fetches current prices for multiple symbols in parallel using the v8 chart endpoint (no crumb required). Returns a `map[string]float64` keyed by both the original and normalised ticker (e.g. both `"BRK B"` and `"BRK-B"`).
+
+```go
+prices, err := client.FetchQuotes(ctx, []string{"AAPL", "BTC-USD", "BRK B"})
+fmt.Println(prices["AAPL"])    // 270.17
+fmt.Println(prices["BRK-B"])   // also accessible as prices["BRK B"]
+```
+
+#### `FetchFXRates(ctx, currencies, base) (map[string]float64, error)`
+
+Fetches spot FX rates for a list of currencies relative to a base currency, in parallel. The base currency is always `1.0`.
+
+```go
+rates, err := client.FetchFXRates(ctx, []string{"EUR", "RON", "USD"}, "USD")
+fmt.Println(rates["EUR"])  // e.g. 0.92
+fmt.Println(rates["RON"])  // e.g. 4.57
+fmt.Println(rates["USD"])  // 1.0
+```
+
+#### `GetMonthlyBar(ctx, ticker, year, month) (*HistoricalBar, error)`
+
+Returns OHLC + average price for a symbol in a given calendar month.
+
+```go
+bar, err := client.GetMonthlyBar(ctx, "AAPL", 2024, 3)
+// bar.Open, bar.High, bar.Low, bar.Close, bar.Avg
+```
+
+Accepts stocks, crypto, and currency pairs.
+
+#### `GetYearlyBar(ctx, ticker, year) (*YearlyBar, error)`
+
+Returns OHLC + average price for a full year, aggregated from quarterly data.
+
+```go
+yearly, err := client.GetYearlyBar(ctx, "AAPL", 2024)
+// yearly.Open, yearly.High, yearly.Low, yearly.Close, yearly.Avg
+```
+
+Accepts stocks, crypto, and currency pairs.
+
+### Helper functions
+
+#### `NormalizeTicker(sym string) string`
+
+Converts broker-style tickers to Yahoo Finance format by replacing spaces with hyphens.
+
+```go
+yahoo.NormalizeTicker("BRK B")  // → "BRK-B"
+yahoo.NormalizeTicker("AAPL")   // → "AAPL"
+```
+
+### Types
+
+```go
+type Quote struct {
+    Symbol   string  `json:"symbol"`
+    Price    float64 `json:"price"`
+    Currency string  `json:"currency"`
+}
+
+type HistoricalBar struct {
+    Symbol string  `json:"symbol"`
+    Year   int     `json:"year"`
+    Month  int     `json:"month"`
+    Open   float64 `json:"open"`
+    High   float64 `json:"high"`
+    Low    float64 `json:"low"`
+    Close  float64 `json:"close"`
+    Avg    float64 `json:"avg"`
+}
+
+type YearlyBar struct {
+    Symbol string  `json:"symbol"`
+    Year   int     `json:"year"`
+    Open   float64 `json:"open"`
+    High   float64 `json:"high"`
+    Low    float64 `json:"low"`
+    Close  float64 `json:"close"`
+    Avg    float64 `json:"avg"`
+}
+```
+
+### Sentinel errors
+
+| Error | When returned |
+|-------|---------------|
+| `yahoo.ErrTickerNotFound` | The symbol returned no results from Yahoo Finance. |
+| `yahoo.ErrAPIError` | Yahoo Finance responded with an API-level error. |
+| `yahoo.ErrNoData` | Yahoo Finance has no data for the requested period. |
+
+```go
+quote, err := client.GetQuote(ctx, "INVALID")
+if errors.Is(err, yahoo.ErrTickerNotFound) {
+    // handle missing symbol
+}
+```
+
+## Development
 
 ```bash
 make build                          # compile binary to .bin/go-finance
