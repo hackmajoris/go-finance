@@ -184,14 +184,14 @@ func newTestClientV8(t *testing.T, srv *httptest.Server) *yahoo.Client {
 	return client
 }
 
-func chartPayload(close float64) interface{} {
+func chartPayload(closePrice float64) interface{} {
 	return map[string]interface{}{
 		"chart": map[string]interface{}{
 			"result": []map[string]interface{}{
 				{
 					"indicators": map[string]interface{}{
 						"quote": []map[string]interface{}{
-							{"close": []float64{close}},
+							{"close": []float64{closePrice}},
 						},
 					},
 				},
