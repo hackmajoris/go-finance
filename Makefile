@@ -1,4 +1,4 @@
-.PHONY: build run test lint fmt clean generate
+.PHONY: build run test lint fmt clean generate release
 
 APP := go-finance
 BIN := .bin/$(APP)
@@ -28,3 +28,11 @@ clean:
 
 generate:
 	go generate ./...
+
+# Usage: make release VERSION=v0.1.4
+release: test
+	@[ -n "$(VERSION)" ] || { echo "Usage: make release VERSION=vX.Y.Z"; exit 1; }
+	@echo "Releasing $(VERSION)..."
+	git tag $(VERSION)
+	git push origin $(VERSION)
+	@echo "Done. Module available at: github.com/hackmajoris/go-finance@$(VERSION)"

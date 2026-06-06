@@ -26,9 +26,10 @@ var (
 )
 
 const (
-	defaultBaseURL = "https://query2.finance.yahoo.com"
-	crumbURL       = "https://query2.finance.yahoo.com/v1/test/getcrumb"
-	financeURL     = "https://finance.yahoo.com/"
+	defaultBaseURL   = "https://query2.finance.yahoo.com"
+	defaultV8BaseURL = "https://query1.finance.yahoo.com"
+	crumbURL         = "https://query2.finance.yahoo.com/v1/test/getcrumb"
+	financeURL       = "https://finance.yahoo.com/"
 )
 
 var reCRSF = regexp.MustCompile(`csrfToken" value="([^"]+)"`)
@@ -43,6 +44,7 @@ type Option func(*Client)
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
+	v8BaseURL  string
 	crumbURL   string
 	crumb      string
 }
@@ -89,6 +91,7 @@ func New(opts ...Option) (*Client, error) {
 	c := &Client{
 		httpClient: &http.Client{Jar: jar},
 		baseURL:    defaultBaseURL,
+		v8BaseURL:  defaultV8BaseURL,
 		crumbURL:   crumbURL,
 	}
 	for _, o := range opts {
@@ -110,6 +113,11 @@ func WithBaseURL(u string) Option {
 // WithCrumbURL overrides the crumb endpoint URL.
 func WithCrumbURL(u string) Option {
 	return func(c *Client) { c.crumbURL = u }
+}
+
+// WithV8BaseURL overrides the Yahoo Finance v8 chart endpoint base URL (useful for testing).
+func WithV8BaseURL(u string) Option {
+	return func(c *Client) { c.v8BaseURL = u }
 }
 
 // WithCrumb injects a pre-fetched crumb, skipping the consent flow.
@@ -503,6 +511,67 @@ func NormalizeTicker(sym string) string {
 	return strings.ReplaceAll(sym, " ", "-")
 }
 
+// FetchMonthlyBar returns the closing price for a symbol in a given calendar month
+// using the v8 chart endpoint — no crumb or consent flow required, works in Docker.
+// Returns ErrNoData when Yahoo has no data for the requested period.
+func (c *Client) FetchMonthlyBar(ctx context.Context, symbol string, year, month int) (float64, error) {
+	period1 := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC).Unix()
+	period2 := time.Date(year, time.Month(month+1), 1, 0, 0, 0, 0, time.UTC).Unix()
+
+	rawURL := fmt.Sprintf(
+		"%s/v8/finance/chart/%s?interval=1mo&period1=%d&period2=%d",
+		c.v8BaseURL, symbol, period1, period2,
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return 0, fmt.Errorf("%w: %s", ErrTickerNotFound, symbol)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("%w: HTTP %d for %s", ErrAPIError, resp.StatusCode, symbol)
+	}
+
+	var payload struct {
+		Chart struct {
+			Result []struct {
+				Indicators struct {
+					Quote []struct {
+						Close []float64 `json:"close"`
+					} `json:"quote"`
+				} `json:"indicators"`
+			} `json:"result"`
+			Error interface{} `json:"error"`
+		} `json:"chart"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return 0, err
+	}
+	if payload.Chart.Error != nil {
+		return 0, fmt.Errorf("%w: %v", ErrNoData, payload.Chart.Error)
+	}
+	if len(payload.Chart.Result) == 0 ||
+		len(payload.Chart.Result[0].Indicators.Quote) == 0 ||
+		len(payload.Chart.Result[0].Indicators.Quote[0].Close) == 0 {
+		return 0, fmt.Errorf("%w: %s %d/%02d", ErrNoData, symbol, year, month)
+	}
+	cls := payload.Chart.Result[0].Indicators.Quote[0].Close[0]
+	if cls == 0 {
+		return 0, fmt.Errorf("%w: zero close for %s %d/%02d", ErrNoData, symbol, year, month)
+	}
+	return cls, nil
+}
+
 // FetchQuotes returns a map of symbol → current price for each symbol in the list,
 // fetching in parallel via the v8 chart endpoint (no crumb required).
 // Both the original and normalized ticker are stored in the result map.
@@ -606,7 +675,7 @@ type chartResponse struct {
 }
 
 func (c *Client) fetchOneChart(ctx context.Context, symbol string) (float64, error) {
-	rawURL := fmt.Sprintf("https://query1.finance.yahoo.com/v8/finance/chart/%s?interval=1d&range=1d", symbol)
+	rawURL := fmt.Sprintf("%s/v8/finance/chart/%s?interval=1d&range=1d", c.v8BaseURL, symbol)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return 0, err

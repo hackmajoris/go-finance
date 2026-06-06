@@ -65,7 +65,7 @@ Flags may appear before or after the ticker: `go-finance AAPL --year 2024` and `
 ## Using the package in another Go app
 
 ```bash
-go get github.com/hackmajoris/go-finance@v0.1.3
+go get github.com/hackmajoris/go-finance@v0.1.4
 ```
 
 ### Quick start
@@ -113,7 +113,14 @@ func main() {
     // Normalize broker tickers to Yahoo Finance format ("BRK B" → "BRK-B")
     fmt.Println(yahoo.NormalizeTicker("BRK B"))
 
-    // Monthly OHLC
+    // Monthly close price (v8 endpoint — no crumb, works in Docker/containers)
+    close, err := client.FetchMonthlyBar(ctx, "^GSPC", 2024, 3)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(close) // e.g. 5218.19
+
+    // Monthly OHLC (v7 endpoint — requires crumb/consent flow)
     bar, err := client.GetMonthlyBar(ctx, "AAPL", 2024, 3)
     if err != nil {
         log.Fatal(err)
@@ -153,7 +160,8 @@ client, err := yahoo.New(yahoo.WithHTTPClient(hc))  // bring your own http.Clien
 | Option | Description |
 |--------|-------------|
 | `WithHTTPClient(hc *http.Client)` | Replace the default HTTP client (e.g. to set timeouts or a proxy). |
-| `WithBaseURL(u string)` | Override the Yahoo Finance API base URL (useful for testing). |
+| `WithBaseURL(u string)` | Override the Yahoo Finance v7 API base URL (useful for testing). |
+| `WithV8BaseURL(u string)` | Override the Yahoo Finance v8 chart endpoint base URL (useful for testing). |
 | `WithCrumbURL(u string)` | Override the crumb endpoint URL. |
 | `WithCrumb(crumb string)` | Inject a pre-fetched crumb, skipping the consent/crumb-fetch flow. |
 
@@ -193,9 +201,20 @@ fmt.Println(rates["RON"])  // e.g. 4.57
 fmt.Println(rates["USD"])  // 1.0
 ```
 
+#### `FetchMonthlyBar(ctx, symbol, year, month) (float64, error)`
+
+Returns the closing price for a symbol in a given calendar month using the **v8 chart endpoint** — no crumb or consent flow required. Works reliably in Docker and other containerised environments.
+
+```go
+close, err := client.FetchMonthlyBar(ctx, "^GSPC", 2024, 3)
+// close → 5218.19
+```
+
+Use this instead of `GetMonthlyBar` when the consent flow is unavailable (e.g. running in a container whose IP is flagged by Yahoo's bot-detection).
+
 #### `GetMonthlyBar(ctx, ticker, year, month) (*HistoricalBar, error)`
 
-Returns OHLC + average price for a symbol in a given calendar month.
+Returns OHLC + average price for a symbol in a given calendar month using the v7 endpoint (requires crumb).
 
 ```go
 bar, err := client.GetMonthlyBar(ctx, "AAPL", 2024, 3)

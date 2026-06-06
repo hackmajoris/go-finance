@@ -171,6 +171,149 @@ func TestGetQuote(t *testing.T) {
 	}
 }
 
+// newTestClientV8 creates a client pointed at srv for v8 endpoint tests.
+func newTestClientV8(t *testing.T, srv *httptest.Server) *yahoo.Client {
+	t.Helper()
+	client, err := yahoo.New(
+		yahoo.WithV8BaseURL(srv.URL),
+		yahoo.WithCrumb("test-crumb"),
+	)
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	return client
+}
+
+func chartPayload(close float64) interface{} {
+	return map[string]interface{}{
+		"chart": map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"indicators": map[string]interface{}{
+						"quote": []map[string]interface{}{
+							{"close": []float64{close}},
+						},
+					},
+				},
+			},
+			"error": nil,
+		},
+	}
+}
+
+func TestFetchMonthlyBar(t *testing.T) {
+	tests := []struct {
+		name      string
+		handler   http.HandlerFunc
+		symbol    string
+		year      int
+		month     int
+		wantClose float64
+		wantErr   error
+	}{
+		{
+			name: "happy path",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(chartPayload(5218.19))
+			},
+			symbol:    "^GSPC",
+			year:      2024,
+			month:     3,
+			wantClose: 5218.19,
+		},
+		{
+			name: "empty result",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"chart": map[string]interface{}{
+						"result": []interface{}{},
+						"error":  nil,
+					},
+				})
+			},
+			symbol:  "^GSPC",
+			year:    2024,
+			month:   3,
+			wantErr: yahoo.ErrNoData,
+		},
+		{
+			name: "zero close treated as no data",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(chartPayload(0))
+			},
+			symbol:  "^GSPC",
+			year:    2024,
+			month:   3,
+			wantErr: yahoo.ErrNoData,
+		},
+		{
+			name: "404 not found",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+			},
+			symbol:  "INVALID",
+			year:    2024,
+			month:   3,
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "http error status",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			symbol:  "^GSPC",
+			year:    2024,
+			month:   3,
+			wantErr: yahoo.ErrAPIError,
+		},
+		{
+			name: "url contains symbol and period params",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v8/finance/chart/^IXIC" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				if r.URL.Query().Get("interval") != "1mo" {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(chartPayload(18003.21))
+			},
+			symbol:    "^IXIC",
+			year:      2024,
+			month:     6,
+			wantClose: 18003.21,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := newTestClientV8(t, srv)
+			got, err := client.FetchMonthlyBar(context.Background(), tc.symbol, tc.year, tc.month)
+
+			if tc.wantErr != nil {
+				if err == nil {
+					t.Fatalf("expected error wrapping %v, got nil", tc.wantErr)
+				}
+				if !errIs(err, tc.wantErr) {
+					t.Fatalf("expected error %v, got %v", tc.wantErr, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.wantClose {
+				t.Errorf("close: got %f, want %f", got, tc.wantClose)
+			}
+		})
+	}
+}
+
 func errIs(got, target error) bool {
 	for got != nil {
 		if got == target {
