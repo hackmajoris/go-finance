@@ -26,9 +26,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	close, err := client.FetchMonthlyBar(context.Background(), ticker, year, month)
+	closePrice, err := client.FetchMonthlyBar(context.Background(), ticker, year, month)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(close)
+	fmt.Println(closePrice)
 }
