@@ -668,33 +668,44 @@ type chartResponse struct {
 		Result []struct {
 			Meta struct {
 				RegularMarketPrice float64 `json:"regularMarketPrice"`
+				FiftyTwoWeekHigh   float64 `json:"fiftyTwoWeekHigh"`
+				FiftyTwoWeekLow    float64 `json:"fiftyTwoWeekLow"`
 			} `json:"meta"`
 		} `json:"result"`
 		Error interface{} `json:"error"`
 	} `json:"chart"`
 }
 
-func (c *Client) fetchOneChart(ctx context.Context, symbol string) (float64, error) {
+// fetchChartMeta fetches the v8 chart meta block for a symbol (no crumb required).
+func (c *Client) fetchChartMeta(ctx context.Context, symbol string) (*chartResponse, error) {
 	rawURL := fmt.Sprintf("%s/v8/finance/chart/%s?interval=1d&range=1d", c.v8BaseURL, symbol)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("%w: HTTP %d", ErrAPIError, resp.StatusCode)
+		return nil, fmt.Errorf("%w: HTTP %d", ErrAPIError, resp.StatusCode)
 	}
 
 	var cr chartResponse
 	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		return nil, err
+	}
+	return &cr, nil
+}
+
+func (c *Client) fetchOneChart(ctx context.Context, symbol string) (float64, error) {
+	cr, err := c.fetchChartMeta(ctx, symbol)
+	if err != nil {
 		return 0, err
 	}
 	if len(cr.Chart.Result) == 0 {
@@ -705,4 +716,63 @@ func (c *Client) fetchOneChart(ctx context.Context, symbol string) (float64, err
 		return 0, fmt.Errorf("%w: %s", ErrTickerNotFound, symbol)
 	}
 	return price, nil
+}
+
+// FiftyTwoWeekRange holds the 52-week high/low price range for a symbol.
+type FiftyTwoWeekRange struct {
+	Symbol  string  `json:"symbol"` // Yahoo Finance ticker
+	High    float64 `json:"high"`
+	Low     float64 `json:"low"`
+	Current float64 `json:"current"` // regular market price
+	Pct     float64 `json:"pct"`     // position of Current between Low (0) and High (1)
+}
+
+// FetchFiftyTwoWeekRange returns the 52-week high/low for a ticker using the v8 chart
+// endpoint — no crumb or consent flow required. Forex pairs like "USD-EUR" are resolved automatically.
+func (c *Client) FetchFiftyTwoWeekRange(ctx context.Context, ticker string) (*FiftyTwoWeekRange, error) {
+	rng, err := c.doFetchFiftyTwoWeekRange(ctx, NormalizeTicker(ticker))
+	if err != nil {
+		return nil, err
+	}
+
+	// Attempt forex pair format for unrecognized symbols.
+	if (rng == nil || (rng.High == 0 && rng.Low == 0)) && reForexPair.MatchString(ticker) {
+		m := reForexPair.FindStringSubmatch(ticker)
+		rng, err = c.doFetchFiftyTwoWeekRange(ctx, m[1]+m[2]+"=X")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if rng == nil || (rng.High == 0 && rng.Low == 0) {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+
+	rng.Symbol = ticker
+	return rng, nil
+}
+
+func (c *Client) doFetchFiftyTwoWeekRange(ctx context.Context, symbol string) (*FiftyTwoWeekRange, error) {
+	cr, err := c.fetchChartMeta(ctx, symbol)
+	if err != nil {
+		return nil, err
+	}
+	if len(cr.Chart.Result) == 0 {
+		return nil, nil
+	}
+	meta := cr.Chart.Result[0].Meta
+	rng := &FiftyTwoWeekRange{
+		High:    meta.FiftyTwoWeekHigh,
+		Low:     meta.FiftyTwoWeekLow,
+		Current: meta.RegularMarketPrice,
+	}
+	if rng.High > rng.Low {
+		rng.Pct = (rng.Current - rng.Low) / (rng.High - rng.Low)
+		if rng.Pct < 0 {
+			rng.Pct = 0
+		} else if rng.Pct > 1 {
+			rng.Pct = 1
+		}
+	}
+	return rng, nil
 }

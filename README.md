@@ -183,6 +183,17 @@ yearly, err := client.GetYearlyBar(ctx, "AAPL", 2024)
 
 Accepts stocks, crypto, and currency pairs.
 
+#### `FetchFiftyTwoWeekRange(ctx, ticker) (*FiftyTwoWeekRange, error)`
+
+Returns the 52-week high/low for a symbol using the **v8 chart endpoint** — no crumb or consent flow required. `Pct` is the position of `Current` between `Low` (0) and `High` (1), clamped to `[0, 1]`, handy for rendering a range bar.
+
+```go
+rng, err := client.FetchFiftyTwoWeekRange(ctx, "AAPL")
+// rng.High, rng.Low, rng.Current, rng.Pct
+```
+
+Accepts stocks, crypto, and currency pairs.
+
 ### Helper functions
 
 #### `NormalizeTicker(sym string) string`
@@ -223,6 +234,14 @@ type YearlyBar struct {
     Close  float64 `json:"close"`
     Avg    float64 `json:"avg"`
 }
+
+type FiftyTwoWeekRange struct {
+    Symbol  string  `json:"symbol"`
+    High    float64 `json:"high"`
+    Low     float64 `json:"low"`
+    Current float64 `json:"current"`
+    Pct     float64 `json:"pct"`
+}
 ```
 
 ### Sentinel errors
@@ -238,6 +257,20 @@ quote, err := client.GetQuote(ctx, "INVALID")
 if errors.Is(err, yahoo.ErrTickerNotFound) {
     // handle missing symbol
 }
+```
+
+## Examples
+
+Runnable examples live in `examples/`, one per method:
+
+```bash
+go run ./examples/quote AAPL
+go run ./examples/monthlybar AAPL 2024 3
+go run ./examples/yearlybar AAPL 2024
+go run ./examples/fetchmonthlybar               # ^GSPC 2024/3 by default
+go run ./examples/fetchquotes AAPL BTC-USD       # defaults to AAPL, BTC-USD, "BRK B"
+go run ./examples/fetchfxrates USD EUR RON       # base currency first
+go run ./examples/fiftytwoweekrange AAPL
 ```
 
 ## Development

@@ -314,6 +314,137 @@ func TestFetchMonthlyBar(t *testing.T) {
 	}
 }
 
+func rangePayload(high, low, current float64) interface{} {
+	return map[string]interface{}{
+		"chart": map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"meta": map[string]interface{}{
+						"fiftyTwoWeekHigh":   high,
+						"fiftyTwoWeekLow":    low,
+						"regularMarketPrice": current,
+					},
+				},
+			},
+			"error": nil,
+		},
+	}
+}
+
+func TestFetchFiftyTwoWeekRange(t *testing.T) {
+	tests := []struct {
+		name        string
+		handler     http.HandlerFunc
+		ticker      string
+		wantSymbol  string
+		wantHigh    float64
+		wantLow     float64
+		wantCurrent float64
+		wantPct     float64
+		wantErr     error
+	}{
+		{
+			name: "happy path stock",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(rangePayload(260.10, 164.08, 212.09))
+			},
+			ticker:      "AAPL",
+			wantSymbol:  "AAPL",
+			wantHigh:    260.10,
+			wantLow:     164.08,
+			wantCurrent: 212.09,
+			wantPct:     0.5, // (212.09-164.08)/(260.10-164.08) ≈ 0.5
+		},
+		{
+			name: "current at low — pct 0",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(rangePayload(260.10, 164.08, 164.08))
+			},
+			ticker:      "AAPL",
+			wantSymbol:  "AAPL",
+			wantHigh:    260.10,
+			wantLow:     164.08,
+			wantCurrent: 164.08,
+			wantPct:     0,
+		},
+		{
+			name: "forex fallback — empty result",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v8/finance/chart/RONUSD=X" {
+					_ = json.NewEncoder(w).Encode(rangePayload(0.235, 0.201, 0.218))
+				} else {
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{
+						"chart": map[string]interface{}{"result": []interface{}{}, "error": nil},
+					})
+				}
+			},
+			ticker:      "RON-USD",
+			wantSymbol:  "RON-USD",
+			wantHigh:    0.235,
+			wantLow:     0.201,
+			wantCurrent: 0.218,
+			wantPct:     0.5,
+		},
+		{
+			name: "ticker not found — empty result",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"chart": map[string]interface{}{"result": []interface{}{}, "error": nil},
+				})
+			},
+			ticker:  "UNKNOWN",
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "http error status",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			ticker:  "AAPL",
+			wantErr: yahoo.ErrAPIError,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := newTestClientV8(t, srv)
+			got, err := client.FetchFiftyTwoWeekRange(context.Background(), tc.ticker)
+
+			if tc.wantErr != nil {
+				if err == nil {
+					t.Fatalf("expected error wrapping %v, got nil", tc.wantErr)
+				}
+				if !errIs(err, tc.wantErr) {
+					t.Fatalf("expected error %v, got %v", tc.wantErr, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Symbol != tc.wantSymbol {
+				t.Errorf("symbol: got %q, want %q", got.Symbol, tc.wantSymbol)
+			}
+			if got.High != tc.wantHigh {
+				t.Errorf("high: got %f, want %f", got.High, tc.wantHigh)
+			}
+			if got.Low != tc.wantLow {
+				t.Errorf("low: got %f, want %f", got.Low, tc.wantLow)
+			}
+			if got.Current != tc.wantCurrent {
+				t.Errorf("current: got %f, want %f", got.Current, tc.wantCurrent)
+			}
+			if diff := got.Pct - tc.wantPct; diff > 1e-9 || diff < -1e-9 {
+				t.Errorf("pct: got %f, want %f", got.Pct, tc.wantPct)
+			}
+		})
+	}
+}
+
 func errIs(got, target error) bool {
 	for got != nil {
 		if got == target {
