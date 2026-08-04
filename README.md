@@ -11,57 +11,6 @@ Fetches real-time and historical stock, crypto, and currency prices from Yahoo F
 - Go 1.22+
 - [golangci-lint](https://golangci-lint.run/)
 
-## CLI usage
-
-```bash
-make build
-
-# Current price
-make run ARGS="AAPL"
-make run ARGS="BTC-USD"
-make run ARGS="USD-EUR"
-
-# Monthly price (OHLC + average)
-make run ARGS="AAPL --year 2024 --month 3"
-
-# Yearly price (aggregated from quarterly data)
-make run ARGS="AAPL --year 2024"
-
-# Yearly price for a currency pair
-make run ARGS="USD-RON --year 2015"
-```
-
-### Output examples
-
-**Current price**
-```json
-{"symbol":"AAPL","price":270.17,"currency":"USD"}
-```
-
-**Monthly (`--year 2024 --month 3`)**
-```json
-{"symbol":"AAPL","year":2024,"month":3,"open":179.55,"high":180.53,"low":168.49,"close":171.48,"avg":175.01}
-```
-
-**Yearly (`--year 2024`)**
-```json
-{"symbol":"AAPL","year":2024,"open":187.15,"high":237.49,"low":164.08,"close":225.91,"avg":203.66}
-```
-
-**Yearly — currency pair (`USD-RON --year 2015`)**
-```json
-{"symbol":"USD-RON","year":2015,"open":3.7029,"high":4.1851,"low":3.7029,"close":4.0333,"avg":3.9061}
-```
-
-### Flags
-
-| Flag | Description |
-|------|-------------|
-| `--year YEAR` | Return historical data for the given year. Omit `--month` for yearly aggregate. |
-| `--month MONTH` | Month (1–12). Requires `--year`. |
-
-Flags may appear before or after the ticker: `go-finance AAPL --year 2024` and `go-finance --year 2024 AAPL` both work.
-
 ## Using the package in another Go app
 
 ```bash
@@ -294,12 +243,8 @@ if errors.Is(err, yahoo.ErrTickerNotFound) {
 ## Development
 
 ```bash
-make build                          # compile binary to .bin/go-finance
-make run ARGS="AAPL"                # current price
-make run ARGS="AAPL --year 2024"    # yearly
-make run ARGS="AAPL --year 2024 --month 3"  # monthly
-make test                           # run tests with race detector
-make lint                           # run linter
+make test    # run tests with race detector
+make lint    # run linter
 ```
 
 ## License

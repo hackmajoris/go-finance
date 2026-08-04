@@ -4,7 +4,6 @@
 github.com/hackmajoris/go-finance
 
 ## Structure
-- `cmd/go-finance/` — single binary entry point; keep thin, wire into `pkg/`
 - `pkg/` — all business logic; each package independently testable
 
 ## Adding a New Package

@@ -1,13 +1,4 @@
-.PHONY: build run test lint fmt clean generate release
-
-APP := go-finance
-BIN := .bin/$(APP)
-
-build:
-	go build -ldflags="-s -w" -o $(BIN) ./cmd/$(APP)
-
-run: build
-	$(BIN) $(ARGS)
+.PHONY: test lint fmt generate release
 
 test:
 	go test -race -cover ./...
@@ -22,9 +13,6 @@ fmt:
 	@which goimports > /dev/null 2>&1 || go install golang.org/x/tools/cmd/goimports@latest
 	gofmt -w .
 	goimports -w .
-
-clean:
-	rm -rf .bin/
 
 generate:
 	go generate ./...
