@@ -127,6 +127,16 @@ quote, err := client.GetQuote(ctx, "AAPL")
 // quote.Currency → "USD"
 ```
 
+#### `GetPE(ctx, ticker) (*PERatio, error)`
+
+Returns the trailing twelve-month and forward P/E ratios for a stock. `ForwardPE` is `0` when Yahoo has no analyst earnings estimate.
+
+```go
+pe, err := client.GetPE(ctx, "AAPL")
+// pe.PE        → 34.71 (trailing)
+// pe.ForwardPE → 28.05
+```
+
 Accepts stocks (`AAPL`), crypto (`BTC-USD`), and currency pairs (`USD-EUR`, `RON-USD`). Forex pairs are resolved to the Yahoo Finance `=X` suffix automatically.
 
 #### `FetchQuotes(ctx, symbols) (map[string]float64, error)`
@@ -214,6 +224,12 @@ type Quote struct {
     Currency string  `json:"currency"`
 }
 
+type PERatio struct {
+    Symbol    string  `json:"symbol"`
+    PE        float64 `json:"pe"`
+    ForwardPE float64 `json:"forwardPE"`
+}
+
 type HistoricalBar struct {
     Symbol string  `json:"symbol"`
     Year   int     `json:"year"`
@@ -265,6 +281,7 @@ Runnable examples live in `examples/`, one per method:
 
 ```bash
 go run ./examples/quote AAPL
+go run ./examples/pe AAPL
 go run ./examples/monthlybar AAPL 2024 3
 go run ./examples/yearlybar AAPL 2024
 go run ./examples/fetchmonthlybar               # ^GSPC 2024/3 by default

@@ -252,7 +252,16 @@ func (c *Client) GetQuote(ctx context.Context, ticker string) (*Quote, error) {
 	return quote, nil
 }
 
-func (c *Client) doGetQuote(ctx context.Context, symbol string) (*Quote, error) {
+type v7QuoteResult struct {
+	Symbol             string  `json:"symbol"`
+	RegularMarketPrice float64 `json:"regularMarketPrice"`
+	Currency           string  `json:"currency"`
+	TrailingPE         float64 `json:"trailingPE"`
+	ForwardPE          float64 `json:"forwardPE"`
+}
+
+// fetchV7Quote fetches the raw v7 quote result for a symbol (requires crumb).
+func (c *Client) fetchV7Quote(ctx context.Context, symbol string) (*v7QuoteResult, error) {
 	u, err := url.Parse(fmt.Sprintf("%s/v7/finance/quote", c.baseURL))
 	if err != nil {
 		return nil, fmt.Errorf("parsing url: %w", err)
@@ -280,12 +289,8 @@ func (c *Client) doGetQuote(ctx context.Context, symbol string) (*Quote, error) 
 
 	var payload struct {
 		QuoteResponse struct {
-			Result []struct {
-				Symbol             string  `json:"symbol"`
-				RegularMarketPrice float64 `json:"regularMarketPrice"`
-				Currency           string  `json:"currency"`
-			} `json:"result"`
-			Error interface{} `json:"error"`
+			Result []v7QuoteResult `json:"result"`
+			Error  interface{}     `json:"error"`
 		} `json:"quoteResponse"`
 	}
 
@@ -302,11 +307,50 @@ func (c *Client) doGetQuote(ctx context.Context, symbol string) (*Quote, error) 
 	}
 
 	r := payload.QuoteResponse.Result[0]
+	return &r, nil
+}
+
+func (c *Client) doGetQuote(ctx context.Context, symbol string) (*Quote, error) {
+	r, err := c.fetchV7Quote(ctx, symbol)
+	if err != nil {
+		return nil, err
+	}
+	if r == nil {
+		return nil, nil
+	}
 	return &Quote{
 		Symbol:   r.Symbol,
 		Price:    r.RegularMarketPrice,
 		Currency: r.Currency,
 	}, nil
+}
+
+// PERatio holds the trailing and forward P/E ratios for a symbol.
+// ForwardPE is 0 when Yahoo has no analyst earnings estimate for the stock.
+type PERatio struct {
+	Symbol    string  `json:"symbol"`    // Yahoo Finance ticker
+	PE        float64 `json:"pe"`        // trailing twelve-month price/earnings ratio
+	ForwardPE float64 `json:"forwardPE"` // price / next fiscal year's estimated earnings
+}
+
+// GetPE returns the trailing and forward P/E ratios for a stock ticker.
+func (c *Client) GetPE(ctx context.Context, ticker string) (*PERatio, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	r, err := c.fetchV7Quote(ctx, ticker)
+	if err != nil {
+		return nil, err
+	}
+
+	if r == nil || (r.TrailingPE == 0 && r.ForwardPE == 0) {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+
+	return &PERatio{Symbol: ticker, PE: r.TrailingPE, ForwardPE: r.ForwardPE}, nil
 }
 
 // GetMonthlyBar returns the OHLC data for a symbol in a given month. Forex pairs like "USD-EUR" are resolved automatically.

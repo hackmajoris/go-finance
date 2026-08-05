@@ -171,6 +171,112 @@ func TestGetQuote(t *testing.T) {
 	}
 }
 
+func peQuotePayload(symbol string, trailingPE, forwardPE float64) interface{} {
+	return map[string]interface{}{
+		"quoteResponse": map[string]interface{}{
+			"result": []map[string]interface{}{
+				{"symbol": symbol, "trailingPE": trailingPE, "forwardPE": forwardPE},
+			},
+			"error": nil,
+		},
+	}
+}
+
+func TestGetPE(t *testing.T) {
+	tests := []struct {
+		name          string
+		handler       http.HandlerFunc
+		ticker        string
+		wantSymbol    string
+		wantPE        float64
+		wantForwardPE float64
+		wantErr       error
+	}{
+		{
+			name: "happy path",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(peQuotePayload("AAPL", 34.71, 28.05))
+			},
+			ticker:        "AAPL",
+			wantSymbol:    "AAPL",
+			wantPE:        34.71,
+			wantForwardPE: 28.05,
+		},
+		{
+			name: "no trailing earnings — forward PE only",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(peQuotePayload("GROWCO", 0, 55.2))
+			},
+			ticker:        "GROWCO",
+			wantSymbol:    "GROWCO",
+			wantPE:        0,
+			wantForwardPE: 55.2,
+		},
+		{
+			name: "ticker not found — empty result",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"quoteResponse": map[string]interface{}{
+						"result": []interface{}{},
+						"error":  nil,
+					},
+				})
+			},
+			ticker:  "UNKNOWN",
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "both PE fields zero — treated as unavailable",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(peQuotePayload("XYZ", 0, 0))
+			},
+			ticker:  "XYZ",
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "http error status",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			ticker:  "AAPL",
+			wantErr: yahoo.ErrAPIError,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := newTestClient(t, srv)
+			got, err := client.GetPE(context.Background(), tc.ticker)
+
+			if tc.wantErr != nil {
+				if err == nil {
+					t.Fatalf("expected error wrapping %v, got nil", tc.wantErr)
+				}
+				if !errIs(err, tc.wantErr) {
+					t.Fatalf("expected error %v, got %v", tc.wantErr, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Symbol != tc.wantSymbol {
+				t.Errorf("symbol: got %q, want %q", got.Symbol, tc.wantSymbol)
+			}
+			if got.ForwardPE != tc.wantForwardPE {
+				t.Errorf("forwardPE: got %f, want %f", got.ForwardPE, tc.wantForwardPE)
+			}
+			if got.PE != tc.wantPE {
+				t.Errorf("pe: got %f, want %f", got.PE, tc.wantPE)
+			}
+		})
+	}
+}
+
 // newTestClientV8 creates a client pointed at srv for v8 endpoint tests.
 func newTestClientV8(t *testing.T, srv *httptest.Server) *yahoo.Client {
 	t.Helper()
