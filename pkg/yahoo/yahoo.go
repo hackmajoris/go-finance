@@ -328,9 +328,26 @@ func (c *Client) doGetQuote(ctx context.Context, symbol string) (*Quote, error) 
 // PERatio holds the trailing and forward P/E ratios for a symbol.
 // ForwardPE is 0 when Yahoo has no analyst earnings estimate for the stock.
 type PERatio struct {
-	Symbol    string  `json:"symbol"`    // Yahoo Finance ticker
-	PE        float64 `json:"pe"`        // trailing twelve-month price/earnings ratio
-	ForwardPE float64 `json:"forwardPE"` // price / next fiscal year's estimated earnings
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	PE             float64 `json:"pe"`             // trailing twelve-month price/earnings ratio
+	ForwardPE      float64 `json:"forwardPE"`      // price / next fiscal year's estimated earnings
+	Interpretation string  `json:"interpretation"` // plain-language read of the ratio; compare against sector peers, not in isolation
+}
+
+// describePE explains what the trailing/forward P/E combination signals.
+func describePE(pe, forwardPE float64) string {
+	switch {
+	case pe == 0:
+		return "No trailing P/E (company has no positive trailing earnings). Forward P/E, if present, reflects analyst earnings estimates instead."
+	case forwardPE == 0:
+		return "No forward P/E (no analyst earnings estimate). Trailing P/E only — compare against sector peers to judge if the stock is cheap or expensive."
+	case forwardPE < pe:
+		return "Forward P/E below trailing P/E: earnings expected to grow, market pricing in improvement."
+	case forwardPE > pe:
+		return "Forward P/E above trailing P/E: earnings expected to shrink, or current earnings include a one-off boost."
+	default:
+		return "Forward P/E roughly equals trailing P/E: earnings expected to stay flat."
+	}
 }
 
 // GetPE returns the trailing and forward P/E ratios for a stock ticker.
@@ -350,7 +367,434 @@ func (c *Client) GetPE(ctx context.Context, ticker string) (*PERatio, error) {
 		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
 	}
 
-	return &PERatio{Symbol: ticker, PE: r.TrailingPE, ForwardPE: r.ForwardPE}, nil
+	return &PERatio{
+		Symbol:         ticker,
+		PE:             r.TrailingPE,
+		ForwardPE:      r.ForwardPE,
+		Interpretation: describePE(r.TrailingPE, r.ForwardPE),
+	}, nil
+}
+
+// FreeCashFlow holds the trailing twelve-month free cash flow for a symbol.
+type FreeCashFlow struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	FCF            float64 `json:"fcf"`            // trailing twelve-month free cash flow, in the reporting currency
+	Interpretation string  `json:"interpretation"` // plain-language read of the value
+}
+
+// describeFCF explains what the free cash flow sign signals.
+func describeFCF(fcf float64) string {
+	switch {
+	case fcf > 0:
+		return "Positive free cash flow: the business generates more cash than it spends on operations and capex, self-funding without relying on debt or share issuance."
+	case fcf < 0:
+		return "Negative free cash flow: the business is burning cash on operations/capex. Normal for early-growth or heavy-capex phases, a warning sign if sustained without a credible path to positive FCF."
+	default:
+		return "Zero free cash flow: operating cash flow exactly offset by capital expenditure."
+	}
+}
+
+// GetFreeCashFlow returns the trailing twelve-month free cash flow for a stock ticker.
+func (c *Client) GetFreeCashFlow(ctx context.Context, ticker string) (*FreeCashFlow, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	fcf, err := c.fetchFreeCashFlow(ctx, ticker)
+	if err != nil {
+		return nil, err
+	}
+	if fcf == nil {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+
+	return &FreeCashFlow{Symbol: ticker, FCF: *fcf, Interpretation: describeFCF(*fcf)}, nil
+}
+
+// fetchFreeCashFlow fetches the financialData.freeCashflow value for a symbol (requires crumb).
+func (c *Client) fetchFreeCashFlow(ctx context.Context, symbol string) (*float64, error) {
+	u, err := url.Parse(fmt.Sprintf("%s/v10/finance/quoteSummary/%s", c.baseURL, symbol))
+	if err != nil {
+		return nil, fmt.Errorf("parsing url: %w", err)
+	}
+	q := u.Query()
+	q.Set("modules", "financialData")
+	q.Set("crumb", c.crumb)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)
+	}
+
+	var payload struct {
+		QuoteSummary struct {
+			Result []struct {
+				FinancialData struct {
+					FreeCashflow struct {
+						Raw float64 `json:"raw"`
+					} `json:"freeCashflow"`
+				} `json:"financialData"`
+			} `json:"result"`
+			Error interface{} `json:"error"`
+		} `json:"quoteSummary"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+
+	if payload.QuoteSummary.Error != nil {
+		return nil, fmt.Errorf("%w: %v", ErrAPIError, payload.QuoteSummary.Error)
+	}
+
+	if len(payload.QuoteSummary.Result) == 0 {
+		return nil, nil
+	}
+
+	fcf := payload.QuoteSummary.Result[0].FinancialData.FreeCashflow.Raw
+	return &fcf, nil
+}
+
+// CashFlowQuality holds operating cash flow against net income for a symbol.
+// Ratio near 1 signals earnings backed by cash. Well below 1 (or negative) signals
+// earnings inflated by non-cash items (accruals, one-off gains) — a quality warning.
+// Well above 1 usually means net income was suppressed by non-cash charges (D&A,
+// impairments) rather than "extra good" — investigate rather than read as bullish.
+// The ratio is unstable whenever NetIncome sits near zero, since any OCF then
+// produces an extreme value regardless of how normal cash generation actually is.
+type CashFlowQuality struct {
+	Symbol            string  `json:"symbol"`            // Yahoo Finance ticker
+	OperatingCashFlow float64 `json:"operatingCashFlow"` // trailing twelve-month cash from operations
+	NetIncome         float64 `json:"netIncome"`         // trailing twelve-month net income
+	Ratio             float64 `json:"ratio"`             // OperatingCashFlow / NetIncome; 0 when NetIncome is 0
+	Interpretation    string  `json:"interpretation"`    // plain-language read of the ratio
+}
+
+// describeCashFlowQuality explains what the OCF/NetIncome ratio signals.
+func describeCashFlowQuality(ratio, netIncome float64) string {
+	switch {
+	case netIncome == 0:
+		return "Net income is zero: ratio undefined, cannot assess earnings quality this way."
+	case ratio >= 0.8 && ratio <= 1.3:
+		return "Ratio close to 1: earnings are roughly cash-backed, a healthy sign."
+	case ratio < 0.8 && ratio >= 0:
+		return "Ratio well below 1: earnings not fully backed by cash — possible accruals or aggressive revenue recognition inflating net income. Worth investigating."
+	case ratio < 0:
+		return "Negative ratio: operating cash flow and net income have opposite signs. Worth investigating which one is the outlier and why."
+	default:
+		return "Ratio well above 1: net income likely suppressed by non-cash charges (depreciation, impairments, write-downs) rather than a sign of extra strength. Also unstable when net income is near zero — check the absolute net income figure before drawing conclusions."
+	}
+}
+
+// GetOperatingCashFlowVsNetIncome returns trailing twelve-month operating cash flow
+// against net income for a stock ticker.
+func (c *Client) GetOperatingCashFlowVsNetIncome(ctx context.Context, ticker string) (*CashFlowQuality, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	q, err := c.fetchCashFlowQuality(ctx, ticker)
+	if err != nil {
+		return nil, err
+	}
+	if q == nil {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+
+	q.Symbol = ticker
+	if q.NetIncome != 0 {
+		q.Ratio = q.OperatingCashFlow / q.NetIncome
+	}
+	q.Interpretation = describeCashFlowQuality(q.Ratio, q.NetIncome)
+	return q, nil
+}
+
+// fetchCashFlowQuality fetches operatingCashflow (financialData) and netIncomeToCommon
+// (defaultKeyStatistics) for a symbol in a single quoteSummary call (requires crumb).
+func (c *Client) fetchCashFlowQuality(ctx context.Context, symbol string) (*CashFlowQuality, error) {
+	u, err := url.Parse(fmt.Sprintf("%s/v10/finance/quoteSummary/%s", c.baseURL, symbol))
+	if err != nil {
+		return nil, fmt.Errorf("parsing url: %w", err)
+	}
+	q := u.Query()
+	q.Set("modules", "financialData,defaultKeyStatistics")
+	q.Set("crumb", c.crumb)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)
+	}
+
+	var payload struct {
+		QuoteSummary struct {
+			Result []struct {
+				FinancialData struct {
+					OperatingCashflow struct {
+						Raw float64 `json:"raw"`
+					} `json:"operatingCashflow"`
+				} `json:"financialData"`
+				DefaultKeyStatistics struct {
+					NetIncomeToCommon struct {
+						Raw float64 `json:"raw"`
+					} `json:"netIncomeToCommon"`
+				} `json:"defaultKeyStatistics"`
+			} `json:"result"`
+			Error interface{} `json:"error"`
+		} `json:"quoteSummary"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+
+	if payload.QuoteSummary.Error != nil {
+		return nil, fmt.Errorf("%w: %v", ErrAPIError, payload.QuoteSummary.Error)
+	}
+
+	if len(payload.QuoteSummary.Result) == 0 {
+		return nil, nil
+	}
+
+	r := payload.QuoteSummary.Result[0]
+	return &CashFlowQuality{
+		OperatingCashFlow: r.FinancialData.OperatingCashflow.Raw,
+		NetIncome:         r.DefaultKeyStatistics.NetIncomeToCommon.Raw,
+	}, nil
+}
+
+// DebtToEquity holds the debt-to-equity ratio for a symbol.
+// Yahoo reports it as a percentage (e.g. 150.5 means total debt is 1.5x total equity).
+type DebtToEquity struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Ratio          float64 `json:"ratio"`          // total debt / total equity, as a percentage
+	Interpretation string  `json:"interpretation"` // plain-language read of the ratio; compare against sector peers, not an absolute threshold
+}
+
+// describeDebtToEquity explains what the debt-to-equity percentage signals.
+func describeDebtToEquity(ratio float64) string {
+	switch {
+	case ratio == 0:
+		return "No reported debt relative to equity — a net-cash or debt-free balance sheet. Not automatically a strength; may just mean the company doesn't use leverage."
+	case ratio < 100:
+		return "Equity funds more of the business than debt. Generally lower interest-rate and refinancing risk, but compare against sector peers — capital-heavy industries (shipping, REITs, utilities) run naturally higher leverage than this and it's still normal for them."
+	default:
+		return "Debt exceeds equity. Higher leverage means higher interest burden and higher risk in a downturn, but common and often healthy in capital-heavy or asset-backed industries (shipping, REITs, utilities). Read against sector peers and pair with cash flow strength, not in isolation."
+	}
+}
+
+// GetDebtToEquity returns the debt-to-equity ratio for a stock ticker.
+func (c *Client) GetDebtToEquity(ctx context.Context, ticker string) (*DebtToEquity, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	ratio, err := c.fetchDebtToEquity(ctx, ticker)
+	if err != nil {
+		return nil, err
+	}
+	if ratio == nil {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+
+	return &DebtToEquity{Symbol: ticker, Ratio: *ratio, Interpretation: describeDebtToEquity(*ratio)}, nil
+}
+
+// fetchDebtToEquity fetches the financialData.debtToEquity value for a symbol (requires crumb).
+func (c *Client) fetchDebtToEquity(ctx context.Context, symbol string) (*float64, error) {
+	u, err := url.Parse(fmt.Sprintf("%s/v10/finance/quoteSummary/%s", c.baseURL, symbol))
+	if err != nil {
+		return nil, fmt.Errorf("parsing url: %w", err)
+	}
+	q := u.Query()
+	q.Set("modules", "financialData")
+	q.Set("crumb", c.crumb)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)
+	}
+
+	var payload struct {
+		QuoteSummary struct {
+			Result []struct {
+				FinancialData struct {
+					DebtToEquity struct {
+						Raw float64 `json:"raw"`
+					} `json:"debtToEquity"`
+				} `json:"financialData"`
+			} `json:"result"`
+			Error interface{} `json:"error"`
+		} `json:"quoteSummary"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+
+	if payload.QuoteSummary.Error != nil {
+		return nil, fmt.Errorf("%w: %v", ErrAPIError, payload.QuoteSummary.Error)
+	}
+
+	if len(payload.QuoteSummary.Result) == 0 {
+		return nil, nil
+	}
+
+	ratio := payload.QuoteSummary.Result[0].FinancialData.DebtToEquity.Raw
+	return &ratio, nil
+}
+
+// EVToEBITDA holds the enterprise-value-to-EBITDA ratio for a symbol.
+// Unlike P/E, it's capital-structure neutral (accounts for debt and cash),
+// which makes it more comparable across companies with different leverage.
+type EVToEBITDA struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Ratio          float64 `json:"ratio"`          // enterprise value / trailing twelve-month EBITDA
+	Interpretation string  `json:"interpretation"` // plain-language read of the ratio; compare against sector peers, not an absolute threshold
+}
+
+// describeEVToEBITDA explains what the EV/EBITDA ratio signals.
+func describeEVToEBITDA(ratio float64) string {
+	switch {
+	case ratio < 0:
+		return "Negative ratio: EBITDA is negative, the business isn't generating positive operating earnings. Common for early-stage or distressed companies — treat as a warning, not a bargain."
+	case ratio == 0:
+		return "Ratio is zero or unavailable — Yahoo has no enterprise value or EBITDA figure for this symbol."
+	case ratio < 10:
+		return "Below 10x: cheap relative to operating earnings by common rule-of-thumb standards, but compare against sector peers — capital-light or high-growth sectors often trade structurally higher."
+	case ratio <= 15:
+		return "Roughly 10x–15x: in the typical range for a stable, moderately valued business. Compare against sector peers for context."
+	default:
+		return "Above 15x: expensive relative to operating earnings — market is pricing in strong growth, or EBITDA is temporarily depressed. Compare against sector peers before reading as overvalued."
+	}
+}
+
+// GetEVToEBITDA returns the enterprise-value-to-EBITDA ratio for a stock ticker.
+func (c *Client) GetEVToEBITDA(ctx context.Context, ticker string) (*EVToEBITDA, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	ratio, err := c.fetchEVToEBITDA(ctx, ticker)
+	if err != nil {
+		return nil, err
+	}
+	if ratio == nil {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+
+	return &EVToEBITDA{Symbol: ticker, Ratio: *ratio, Interpretation: describeEVToEBITDA(*ratio)}, nil
+}
+
+// fetchEVToEBITDA fetches the defaultKeyStatistics.enterpriseToEbitda value for a symbol (requires crumb).
+func (c *Client) fetchEVToEBITDA(ctx context.Context, symbol string) (*float64, error) {
+	u, err := url.Parse(fmt.Sprintf("%s/v10/finance/quoteSummary/%s", c.baseURL, symbol))
+	if err != nil {
+		return nil, fmt.Errorf("parsing url: %w", err)
+	}
+	q := u.Query()
+	q.Set("modules", "defaultKeyStatistics")
+	q.Set("crumb", c.crumb)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)
+	}
+
+	var payload struct {
+		QuoteSummary struct {
+			Result []struct {
+				DefaultKeyStatistics struct {
+					EnterpriseToEbitda struct {
+						Raw float64 `json:"raw"`
+					} `json:"enterpriseToEbitda"`
+				} `json:"defaultKeyStatistics"`
+			} `json:"result"`
+			Error interface{} `json:"error"`
+		} `json:"quoteSummary"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+
+	if payload.QuoteSummary.Error != nil {
+		return nil, fmt.Errorf("%w: %v", ErrAPIError, payload.QuoteSummary.Error)
+	}
+
+	if len(payload.QuoteSummary.Result) == 0 {
+		return nil, nil
+	}
+
+	ratio := payload.QuoteSummary.Result[0].DefaultKeyStatistics.EnterpriseToEbitda.Raw
+	return &ratio, nil
 }
 
 // GetMonthlyBar returns the OHLC data for a symbol in a given month. Forex pairs like "USD-EUR" are resolved automatically.

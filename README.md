@@ -139,6 +139,48 @@ pe, err := client.GetPE(ctx, "AAPL")
 
 Accepts stocks (`AAPL`), crypto (`BTC-USD`), and currency pairs (`USD-EUR`, `RON-USD`). Forex pairs are resolved to the Yahoo Finance `=X` suffix automatically.
 
+#### `GetFreeCashFlow(ctx, ticker) (*FreeCashFlow, error)`
+
+Returns the trailing twelve-month free cash flow for a stock, plus a plain-language `Interpretation` of the sign.
+
+```go
+fcf, err := client.GetFreeCashFlow(ctx, "AAPL")
+// fcf.FCF            → 1.07721875456e+11
+// fcf.Interpretation → "Positive free cash flow: the business generates more cash..."
+```
+
+#### `GetOperatingCashFlowVsNetIncome(ctx, ticker) (*CashFlowQuality, error)`
+
+Returns trailing twelve-month operating cash flow against net income — an earnings-quality check. `Ratio` near `1` means earnings are cash-backed; well below `1` (or negative) flags possible accrual-inflated earnings; well above `1` usually means net income was suppressed by non-cash charges rather than a bullish signal, and the ratio grows unstable as `NetIncome` approaches zero. `Interpretation` explains which bucket the result falls into.
+
+```go
+q, err := client.GetOperatingCashFlowVsNetIncome(ctx, "AAPL")
+// q.OperatingCashFlow → 1.46723995648e+11
+// q.NetIncome         → 1.289299968e+11
+// q.Ratio             → 1.138...
+// q.Interpretation    → "Ratio close to 1: earnings are roughly cash-backed..."
+```
+
+#### `GetDebtToEquity(ctx, ticker) (*DebtToEquity, error)`
+
+Returns the debt-to-equity ratio (total debt / total equity, as a percentage). `Ratio` is `0` for a legitimate debt-free/net-cash company, not an error. Read against sector peers, not an absolute threshold — capital-heavy industries (shipping, REITs, utilities) run naturally higher leverage.
+
+```go
+d2e, err := client.GetDebtToEquity(ctx, "AAPL")
+// d2e.Ratio          → 78.445
+// d2e.Interpretation → "Equity funds more of the business than debt..."
+```
+
+#### `GetEVToEBITDA(ctx, ticker) (*EVToEBITDA, error)`
+
+Returns the enterprise-value-to-EBITDA ratio — capital-structure neutral (accounts for debt and cash), which makes it more comparable across companies with different leverage than P/E. A negative ratio means EBITDA is negative and is returned as valid data, not an error.
+
+```go
+ev, err := client.GetEVToEBITDA(ctx, "AAPL")
+// ev.Ratio          → 27.01
+// ev.Interpretation → "Above 15x: expensive relative to operating earnings..."
+```
+
 #### `FetchQuotes(ctx, symbols) (map[string]float64, error)`
 
 Fetches current prices for multiple symbols in parallel using the v8 chart endpoint (no crumb required). Returns a `map[string]float64` keyed by both the original and normalised ticker (e.g. both `"BRK B"` and `"BRK-B"`).
@@ -236,9 +278,36 @@ type Quote struct {
 }
 
 type PERatio struct {
-    Symbol    string  `json:"symbol"`
-    PE        float64 `json:"pe"`
-    ForwardPE float64 `json:"forwardPE"`
+    Symbol         string  `json:"symbol"`
+    PE             float64 `json:"pe"`
+    ForwardPE      float64 `json:"forwardPE"`
+    Interpretation string  `json:"interpretation"`
+}
+
+type FreeCashFlow struct {
+    Symbol         string  `json:"symbol"`
+    FCF            float64 `json:"fcf"`
+    Interpretation string  `json:"interpretation"`
+}
+
+type CashFlowQuality struct {
+    Symbol            string  `json:"symbol"`
+    OperatingCashFlow float64 `json:"operatingCashFlow"`
+    NetIncome         float64 `json:"netIncome"`
+    Ratio             float64 `json:"ratio"`
+    Interpretation    string  `json:"interpretation"`
+}
+
+type DebtToEquity struct {
+    Symbol         string  `json:"symbol"`
+    Ratio          float64 `json:"ratio"`
+    Interpretation string  `json:"interpretation"`
+}
+
+type EVToEBITDA struct {
+    Symbol         string  `json:"symbol"`
+    Ratio          float64 `json:"ratio"`
+    Interpretation string  `json:"interpretation"`
 }
 
 type HistoricalBar struct {
@@ -301,6 +370,10 @@ Runnable examples live in `examples/`, one per method:
 ```bash
 go run ./examples/quote AAPL
 go run ./examples/pe AAPL
+go run ./examples/freecashflow AAPL
+go run ./examples/cashflowquality AAPL
+go run ./examples/debttoequity AAPL
+go run ./examples/evtoebitda AAPL
 go run ./examples/monthlybar AAPL 2024 3
 go run ./examples/yearlybar AAPL 2024
 go run ./examples/fetchmonthlybar               # ^GSPC 2024/3 by default
@@ -308,6 +381,7 @@ go run ./examples/fetchquotes AAPL BTC-USD       # defaults to AAPL, BTC-USD, "B
 go run ./examples/fetchfxrates USD EUR RON       # base currency first
 go run ./examples/fiftytwoweekrange AAPL
 go run ./examples/performance AAPL
+go run ./examples/summary AAPL                   # every no-extra-params indicator for one ticker
 ```
 
 ## Development

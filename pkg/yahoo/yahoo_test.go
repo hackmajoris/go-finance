@@ -274,6 +274,463 @@ func TestGetPE(t *testing.T) {
 			if got.PE != tc.wantPE {
 				t.Errorf("pe: got %f, want %f", got.PE, tc.wantPE)
 			}
+			if got.Interpretation == "" {
+				t.Error("interpretation: got empty string, want a non-empty explanation")
+			}
+		})
+	}
+}
+
+func fcfPayload(freeCashflow float64) interface{} {
+	return map[string]interface{}{
+		"quoteSummary": map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"financialData": map[string]interface{}{
+						"freeCashflow": map[string]interface{}{"raw": freeCashflow},
+					},
+				},
+			},
+			"error": nil,
+		},
+	}
+}
+
+func TestGetFreeCashFlow(t *testing.T) {
+	tests := []struct {
+		name       string
+		handler    http.HandlerFunc
+		ticker     string
+		wantSymbol string
+		wantFCF    float64
+		wantErr    error
+	}{
+		{
+			name: "happy path",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(fcfPayload(1.1e11))
+			},
+			ticker:     "AAPL",
+			wantSymbol: "AAPL",
+			wantFCF:    1.1e11,
+		},
+		{
+			name: "negative free cash flow",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(fcfPayload(-5.2e9))
+			},
+			ticker:     "BURNCO",
+			wantSymbol: "BURNCO",
+			wantFCF:    -5.2e9,
+		},
+		{
+			name: "ticker not found — empty result",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"quoteSummary": map[string]interface{}{
+						"result": []interface{}{},
+						"error":  nil,
+					},
+				})
+			},
+			ticker:  "UNKNOWN",
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "404 not found",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+			},
+			ticker:  "INVALID",
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "http error status",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			ticker:  "AAPL",
+			wantErr: yahoo.ErrAPIError,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := newTestClient(t, srv)
+			got, err := client.GetFreeCashFlow(context.Background(), tc.ticker)
+
+			if tc.wantErr != nil {
+				if err == nil {
+					t.Fatalf("expected error wrapping %v, got nil", tc.wantErr)
+				}
+				if !errIs(err, tc.wantErr) {
+					t.Fatalf("expected error %v, got %v", tc.wantErr, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Symbol != tc.wantSymbol {
+				t.Errorf("symbol: got %q, want %q", got.Symbol, tc.wantSymbol)
+			}
+			if got.FCF != tc.wantFCF {
+				t.Errorf("fcf: got %f, want %f", got.FCF, tc.wantFCF)
+			}
+			if got.Interpretation == "" {
+				t.Error("interpretation: got empty string, want a non-empty explanation")
+			}
+		})
+	}
+}
+
+func cashFlowQualityPayload(operatingCashflow, netIncome float64) interface{} {
+	return map[string]interface{}{
+		"quoteSummary": map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"financialData": map[string]interface{}{
+						"operatingCashflow": map[string]interface{}{"raw": operatingCashflow},
+					},
+					"defaultKeyStatistics": map[string]interface{}{
+						"netIncomeToCommon": map[string]interface{}{"raw": netIncome},
+					},
+				},
+			},
+			"error": nil,
+		},
+	}
+}
+
+func TestGetOperatingCashFlowVsNetIncome(t *testing.T) {
+	tests := []struct {
+		name       string
+		handler    http.HandlerFunc
+		ticker     string
+		wantSymbol string
+		wantOCF    float64
+		wantNI     float64
+		wantRatio  float64
+		wantErr    error
+	}{
+		{
+			name: "happy path — cash-backed earnings",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(cashFlowQualityPayload(1.2e11, 1.0e11))
+			},
+			ticker:     "AAPL",
+			wantSymbol: "AAPL",
+			wantOCF:    1.2e11,
+			wantNI:     1.0e11,
+			wantRatio:  1.2,
+		},
+		{
+			name: "net income negative — ratio negative",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(cashFlowQualityPayload(2.0e9, -1.0e9))
+			},
+			ticker:     "LOSSCO",
+			wantSymbol: "LOSSCO",
+			wantOCF:    2.0e9,
+			wantNI:     -1.0e9,
+			wantRatio:  -2.0,
+		},
+		{
+			name: "net income zero — ratio stays zero",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(cashFlowQualityPayload(5.0e8, 0))
+			},
+			ticker:     "BREAKEVEN",
+			wantSymbol: "BREAKEVEN",
+			wantOCF:    5.0e8,
+			wantNI:     0,
+			wantRatio:  0,
+		},
+		{
+			name: "ticker not found — empty result",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"quoteSummary": map[string]interface{}{
+						"result": []interface{}{},
+						"error":  nil,
+					},
+				})
+			},
+			ticker:  "UNKNOWN",
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "404 not found",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+			},
+			ticker:  "INVALID",
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "http error status",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			ticker:  "AAPL",
+			wantErr: yahoo.ErrAPIError,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := newTestClient(t, srv)
+			got, err := client.GetOperatingCashFlowVsNetIncome(context.Background(), tc.ticker)
+
+			if tc.wantErr != nil {
+				if err == nil {
+					t.Fatalf("expected error wrapping %v, got nil", tc.wantErr)
+				}
+				if !errIs(err, tc.wantErr) {
+					t.Fatalf("expected error %v, got %v", tc.wantErr, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Symbol != tc.wantSymbol {
+				t.Errorf("symbol: got %q, want %q", got.Symbol, tc.wantSymbol)
+			}
+			if got.OperatingCashFlow != tc.wantOCF {
+				t.Errorf("operatingCashFlow: got %f, want %f", got.OperatingCashFlow, tc.wantOCF)
+			}
+			if got.NetIncome != tc.wantNI {
+				t.Errorf("netIncome: got %f, want %f", got.NetIncome, tc.wantNI)
+			}
+			if diff := got.Ratio - tc.wantRatio; diff > 1e-9 || diff < -1e-9 {
+				t.Errorf("ratio: got %f, want %f", got.Ratio, tc.wantRatio)
+			}
+			if got.Interpretation == "" {
+				t.Error("interpretation: got empty string, want a non-empty explanation")
+			}
+		})
+	}
+}
+
+func debtToEquityPayload(ratio float64) interface{} {
+	return map[string]interface{}{
+		"quoteSummary": map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"financialData": map[string]interface{}{
+						"debtToEquity": map[string]interface{}{"raw": ratio},
+					},
+				},
+			},
+			"error": nil,
+		},
+	}
+}
+
+func TestGetDebtToEquity(t *testing.T) {
+	tests := []struct {
+		name       string
+		handler    http.HandlerFunc
+		ticker     string
+		wantSymbol string
+		wantRatio  float64
+		wantErr    error
+	}{
+		{
+			name: "happy path",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(debtToEquityPayload(150.5))
+			},
+			ticker:     "AAPL",
+			wantSymbol: "AAPL",
+			wantRatio:  150.5,
+		},
+		{
+			name: "zero debt — legitimate net-cash company, not an error",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(debtToEquityPayload(0))
+			},
+			ticker:     "DEBTFREE",
+			wantSymbol: "DEBTFREE",
+			wantRatio:  0,
+		},
+		{
+			name: "ticker not found — empty result",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"quoteSummary": map[string]interface{}{
+						"result": []interface{}{},
+						"error":  nil,
+					},
+				})
+			},
+			ticker:  "UNKNOWN",
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "404 not found",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+			},
+			ticker:  "INVALID",
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "http error status",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			ticker:  "AAPL",
+			wantErr: yahoo.ErrAPIError,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := newTestClient(t, srv)
+			got, err := client.GetDebtToEquity(context.Background(), tc.ticker)
+
+			if tc.wantErr != nil {
+				if err == nil {
+					t.Fatalf("expected error wrapping %v, got nil", tc.wantErr)
+				}
+				if !errIs(err, tc.wantErr) {
+					t.Fatalf("expected error %v, got %v", tc.wantErr, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Symbol != tc.wantSymbol {
+				t.Errorf("symbol: got %q, want %q", got.Symbol, tc.wantSymbol)
+			}
+			if got.Ratio != tc.wantRatio {
+				t.Errorf("ratio: got %f, want %f", got.Ratio, tc.wantRatio)
+			}
+			if got.Interpretation == "" {
+				t.Error("interpretation: got empty string, want a non-empty explanation")
+			}
+		})
+	}
+}
+
+func evToEBITDAPayload(ratio float64) interface{} {
+	return map[string]interface{}{
+		"quoteSummary": map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"defaultKeyStatistics": map[string]interface{}{
+						"enterpriseToEbitda": map[string]interface{}{"raw": ratio},
+					},
+				},
+			},
+			"error": nil,
+		},
+	}
+}
+
+func TestGetEVToEBITDA(t *testing.T) {
+	tests := []struct {
+		name       string
+		handler    http.HandlerFunc
+		ticker     string
+		wantSymbol string
+		wantRatio  float64
+		wantErr    error
+	}{
+		{
+			name: "happy path",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(evToEBITDAPayload(12.4))
+			},
+			ticker:     "AAPL",
+			wantSymbol: "AAPL",
+			wantRatio:  12.4,
+		},
+		{
+			name: "negative EBITDA — negative ratio, not an error",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(evToEBITDAPayload(-8.1))
+			},
+			ticker:     "BURNCO",
+			wantSymbol: "BURNCO",
+			wantRatio:  -8.1,
+		},
+		{
+			name: "ticker not found — empty result",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"quoteSummary": map[string]interface{}{
+						"result": []interface{}{},
+						"error":  nil,
+					},
+				})
+			},
+			ticker:  "UNKNOWN",
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "404 not found",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNotFound)
+			},
+			ticker:  "INVALID",
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name: "http error status",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			ticker:  "AAPL",
+			wantErr: yahoo.ErrAPIError,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			client := newTestClient(t, srv)
+			got, err := client.GetEVToEBITDA(context.Background(), tc.ticker)
+
+			if tc.wantErr != nil {
+				if err == nil {
+					t.Fatalf("expected error wrapping %v, got nil", tc.wantErr)
+				}
+				if !errIs(err, tc.wantErr) {
+					t.Fatalf("expected error %v, got %v", tc.wantErr, err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Symbol != tc.wantSymbol {
+				t.Errorf("symbol: got %q, want %q", got.Symbol, tc.wantSymbol)
+			}
+			if got.Ratio != tc.wantRatio {
+				t.Errorf("ratio: got %f, want %f", got.Ratio, tc.wantRatio)
+			}
+			if got.Interpretation == "" {
+				t.Error("interpretation: got empty string, want a non-empty explanation")
+			}
 		})
 	}
 }
