@@ -204,6 +204,17 @@ rng, err := client.FetchFiftyTwoWeekRange(ctx, "AAPL")
 
 Accepts stocks, crypto, and currency pairs.
 
+#### `FetchPerformance(ctx, ticker) (*PerformanceReturns, error)`
+
+Returns YTD, 1-year, 3-year, and 5-year percentage price change using the **v8 chart endpoint** — no crumb or consent flow required. A period is `0` when the symbol has no trading history that far back (e.g. a recent IPO).
+
+```go
+perf, err := client.FetchPerformance(ctx, "AAPL")
+// perf.YTD, perf.OneYear, perf.ThreeYear, perf.FiveYear
+```
+
+Accepts stocks, crypto, and currency pairs.
+
 ### Helper functions
 
 #### `NormalizeTicker(sym string) string`
@@ -258,6 +269,14 @@ type FiftyTwoWeekRange struct {
     Current float64 `json:"current"`
     Pct     float64 `json:"pct"`
 }
+
+type PerformanceReturns struct {
+    Symbol    string  `json:"symbol"`
+    YTD       float64 `json:"ytd"`
+    OneYear   float64 `json:"oneYear"`
+    ThreeYear float64 `json:"threeYear"`
+    FiveYear  float64 `json:"fiveYear"`
+}
 ```
 
 ### Sentinel errors
@@ -288,6 +307,7 @@ go run ./examples/fetchmonthlybar               # ^GSPC 2024/3 by default
 go run ./examples/fetchquotes AAPL BTC-USD       # defaults to AAPL, BTC-USD, "BRK B"
 go run ./examples/fetchfxrates USD EUR RON       # base currency first
 go run ./examples/fiftytwoweekrange AAPL
+go run ./examples/performance AAPL
 ```
 
 ## Development

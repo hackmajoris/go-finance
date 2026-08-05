@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/hackmajoris/go-finance/pkg/yahoo"
 )
@@ -549,6 +550,146 @@ func TestFetchFiftyTwoWeekRange(t *testing.T) {
 			}
 		})
 	}
+}
+
+func historyPayload(current float64, points map[time.Time]float64) interface{} {
+	// sort by time ascending
+	times := make([]time.Time, 0, len(points))
+	for t := range points {
+		times = append(times, t)
+	}
+	for i := 1; i < len(times); i++ {
+		for j := i; j > 0 && times[j].Before(times[j-1]); j-- {
+			times[j], times[j-1] = times[j-1], times[j]
+		}
+	}
+
+	timestamps := make([]int64, len(times))
+	closes := make([]float64, len(times))
+	for i, t := range times {
+		timestamps[i] = t.Unix()
+		closes[i] = points[t]
+	}
+
+	return map[string]interface{}{
+		"chart": map[string]interface{}{
+			"result": []map[string]interface{}{
+				{
+					"meta":      map[string]interface{}{"regularMarketPrice": current},
+					"timestamp": timestamps,
+					"indicators": map[string]interface{}{
+						"quote": []map[string]interface{}{
+							{"close": closes},
+						},
+					},
+				},
+			},
+			"error": nil,
+		},
+	}
+}
+
+func TestFetchPerformance(t *testing.T) {
+	now := time.Now().UTC()
+	ytdTarget := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	oneYearTarget := now.AddDate(-1, 0, 0)
+	threeYearTarget := now.AddDate(-3, 0, 0)
+	fiveYearTarget := now.AddDate(-5, 0, 0)
+
+	t.Run("happy path", func(t *testing.T) {
+		current, five, three, one, ytd := 120.0, 50.0, 80.0, 90.0, 95.0
+		payload := historyPayload(current, map[time.Time]float64{
+			fiveYearTarget:  five,
+			threeYearTarget: three,
+			oneYearTarget:   one,
+			ytdTarget:       ytd,
+		})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(payload)
+		}))
+		defer srv.Close()
+
+		client := newTestClientV8(t, srv)
+		got, err := client.FetchPerformance(context.Background(), "AAPL")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if got.Symbol != "AAPL" {
+			t.Errorf("symbol: got %q, want %q", got.Symbol, "AAPL")
+		}
+		// computed via variables (not constants) to match the runtime float64 rounding the library does
+		wantYTD := (current - ytd) / ytd * 100
+		wantOneYear := (current - one) / one * 100
+		wantThreeYear := (current - three) / three * 100
+		wantFiveYear := (current - five) / five * 100
+		if got.YTD != wantYTD {
+			t.Errorf("ytd: got %f, want %f", got.YTD, wantYTD)
+		}
+		if got.OneYear != wantOneYear {
+			t.Errorf("oneYear: got %f, want %f", got.OneYear, wantOneYear)
+		}
+		if got.ThreeYear != wantThreeYear {
+			t.Errorf("threeYear: got %f, want %f", got.ThreeYear, wantThreeYear)
+		}
+		if got.FiveYear != wantFiveYear {
+			t.Errorf("fiveYear: got %f, want %f", got.FiveYear, wantFiveYear)
+		}
+	})
+
+	t.Run("short history — older periods stay zero", func(t *testing.T) {
+		payload := historyPayload(120, map[time.Time]float64{
+			oneYearTarget: 90,
+			ytdTarget:     95,
+		})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(payload)
+		}))
+		defer srv.Close()
+
+		client := newTestClientV8(t, srv)
+		got, err := client.FetchPerformance(context.Background(), "RECENTIPO")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.ThreeYear != 0 {
+			t.Errorf("threeYear: got %f, want 0 (no history that far back)", got.ThreeYear)
+		}
+		if got.FiveYear != 0 {
+			t.Errorf("fiveYear: got %f, want 0 (no history that far back)", got.FiveYear)
+		}
+		if got.OneYear == 0 {
+			t.Errorf("oneYear: got 0, want a non-zero computed value")
+		}
+	})
+
+	t.Run("ticker not found — empty result", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"chart": map[string]interface{}{"result": []interface{}{}, "error": nil},
+			})
+		}))
+		defer srv.Close()
+
+		client := newTestClientV8(t, srv)
+		_, err := client.FetchPerformance(context.Background(), "UNKNOWN")
+		if !errIs(err, yahoo.ErrTickerNotFound) {
+			t.Fatalf("expected error %v, got %v", yahoo.ErrTickerNotFound, err)
+		}
+	})
+
+	t.Run("http error status", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		client := newTestClientV8(t, srv)
+		_, err := client.FetchPerformance(context.Background(), "AAPL")
+		if !errIs(err, yahoo.ErrAPIError) {
+			t.Fatalf("expected error %v, got %v", yahoo.ErrAPIError, err)
+		}
+	})
 }
 
 func errIs(got, target error) bool {

@@ -820,3 +820,148 @@ func (c *Client) doFetchFiftyTwoWeekRange(ctx context.Context, symbol string) (*
 	}
 	return rng, nil
 }
+
+// PerformanceReturns holds percentage price change over several look-back periods.
+// A period is 0 when the symbol has no trading history that far back (e.g. a recent IPO).
+type PerformanceReturns struct {
+	Symbol    string  `json:"symbol"`    // Yahoo Finance ticker
+	YTD       float64 `json:"ytd"`       // % change since Jan 1 of the current year
+	OneYear   float64 `json:"oneYear"`   // % change over the trailing 1 year
+	ThreeYear float64 `json:"threeYear"` // % change over the trailing 3 years
+	FiveYear  float64 `json:"fiveYear"`  // % change over the trailing 5 years
+}
+
+type chartHistoryResponse struct {
+	Chart struct {
+		Result []struct {
+			Meta struct {
+				RegularMarketPrice float64 `json:"regularMarketPrice"`
+			} `json:"meta"`
+			Timestamp  []int64 `json:"timestamp"`
+			Indicators struct {
+				Quote []struct {
+					Close []float64 `json:"close"`
+				} `json:"quote"`
+			} `json:"indicators"`
+		} `json:"result"`
+		Error interface{} `json:"error"`
+	} `json:"chart"`
+}
+
+// fetchPriceHistory fetches 5 years of daily closes for a symbol (no crumb required).
+func (c *Client) fetchPriceHistory(ctx context.Context, symbol string) (*chartHistoryResponse, error) {
+	rawURL := fmt.Sprintf("%s/v8/finance/chart/%s?interval=1d&range=5y", c.v8BaseURL, symbol)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: HTTP %d", ErrAPIError, resp.StatusCode)
+	}
+
+	var cr chartHistoryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		return nil, err
+	}
+	return &cr, nil
+}
+
+// closeAtOrBefore returns the last non-zero close at or before target (unix seconds),
+// assuming timestamps is sorted ascending.
+// closeAtOrBefore compares by calendar date rather than exact timestamp: intraday
+// trading timestamps (e.g. market open) can fall later in the day than target's
+// time-of-day even when they land on the same or an earlier calendar date.
+func closeAtOrBefore(timestamps []int64, closes []float64, target time.Time) (float64, bool) {
+	targetDay := target.Truncate(24 * time.Hour)
+	price, found := 0.0, false
+	for i, ts := range timestamps {
+		day := time.Unix(ts, 0).UTC().Truncate(24 * time.Hour)
+		if day.After(targetDay) {
+			break
+		}
+		if i < len(closes) && closes[i] != 0 {
+			price, found = closes[i], true
+		}
+	}
+	return price, found
+}
+
+// FetchPerformance returns YTD, 1-year, 3-year, and 5-year percentage price change for a
+// ticker using the v8 chart endpoint — no crumb or consent flow required. Forex pairs like
+// "USD-EUR" are resolved automatically. A period is 0 when history doesn't reach that far back.
+func (c *Client) FetchPerformance(ctx context.Context, ticker string) (*PerformanceReturns, error) {
+	perf, err := c.doFetchPerformance(ctx, NormalizeTicker(ticker))
+	if err != nil {
+		return nil, err
+	}
+
+	// Attempt forex pair format for unrecognized symbols.
+	if perf == nil && reForexPair.MatchString(ticker) {
+		m := reForexPair.FindStringSubmatch(ticker)
+		perf, err = c.doFetchPerformance(ctx, m[1]+m[2]+"=X")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if perf == nil {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+
+	perf.Symbol = ticker
+	return perf, nil
+}
+
+func (c *Client) doFetchPerformance(ctx context.Context, symbol string) (*PerformanceReturns, error) {
+	cr, err := c.fetchPriceHistory(ctx, symbol)
+	if err != nil {
+		return nil, err
+	}
+	if len(cr.Chart.Result) == 0 {
+		return nil, nil
+	}
+	result := cr.Chart.Result[0]
+	if len(result.Indicators.Quote) == 0 || len(result.Timestamp) == 0 {
+		return nil, nil
+	}
+	closes := result.Indicators.Quote[0].Close
+
+	current := result.Meta.RegularMarketPrice
+	if current == 0 {
+		// fall back to the most recent close in the series
+		for i := len(closes) - 1; i >= 0; i-- {
+			if closes[i] != 0 {
+				current = closes[i]
+				break
+			}
+		}
+	}
+	if current == 0 {
+		return nil, nil
+	}
+
+	now := time.Now().UTC()
+	pctSince := func(target time.Time) float64 {
+		start, found := closeAtOrBefore(result.Timestamp, closes, target)
+		if !found || start == 0 {
+			return 0
+		}
+		return (current - start) / start * 100
+	}
+
+	return &PerformanceReturns{
+		YTD:       pctSince(time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)),
+		OneYear:   pctSince(now.AddDate(-1, 0, 0)),
+		ThreeYear: pctSince(now.AddDate(-3, 0, 0)),
+		FiveYear:  pctSince(now.AddDate(-5, 0, 0)),
+	}, nil
+}
