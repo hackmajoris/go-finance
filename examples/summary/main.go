@@ -1,6 +1,6 @@
 // Command summary prints every crumb-free-of-params indicator for a single stock ticker
-// as a table: quote, P/E, free cash flow, cash flow quality, debt-to-equity, EV/EBITDA,
-// 52-week range, and performance returns.
+// as a table: quote, health rating, valuation rating, P/E, free cash flow, cash flow
+// quality, debt-to-equity, EV/EBITDA, 52-week range, and performance returns.
 package main
 
 import (
@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/hackmajoris/go-finance/pkg/yahoo"
@@ -57,35 +58,48 @@ func main() {
 		rows = append(rows, row{"Price", fmt.Sprintf("%.2f %s", quote.Price, quote.Currency), ""})
 	}
 
-	if pe, err := client.GetPE(ctx, ticker); err != nil {
-		rows = append(rows, row{"P/E", "error: " + err.Error(), ""})
+	// fetched up front (rather than inline in the table build below) so ClassifyHealth
+	// and ClassifyValuation can reuse them without extra requests
+	pe, peErr := client.GetPE(ctx, ticker)
+	fcf, fcfErr := client.GetFreeCashFlow(ctx, ticker)
+	cfq, cfqErr := client.GetOperatingCashFlowVsNetIncome(ctx, ticker)
+	d2e, d2eErr := client.GetDebtToEquity(ctx, ticker)
+	ev, evErr := client.GetEVToEBITDA(ctx, ticker)
+
+	health, healthReason := yahoo.ClassifyHealth(fcf, cfq, d2e)
+	valuation, valuationReason := yahoo.ClassifyValuation(pe, ev)
+	rows = append(rows, row{"Health", strings.ToUpper(string(health)), healthReason})
+	rows = append(rows, row{"Valuation", strings.ToUpper(string(valuation)), valuationReason})
+
+	if peErr != nil {
+		rows = append(rows, row{"P/E", "error: " + peErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"P/E (trailing)", fmt.Sprintf("%.2f", pe.PE), pe.Interpretation})
 		rows = append(rows, row{"P/E (forward)", fmt.Sprintf("%.2f", pe.ForwardPE), ""})
 	}
 
-	if fcf, err := client.GetFreeCashFlow(ctx, ticker); err != nil {
-		rows = append(rows, row{"Free Cash Flow", "error: " + err.Error(), ""})
+	if fcfErr != nil {
+		rows = append(rows, row{"Free Cash Flow", "error: " + fcfErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Free Cash Flow", formatMoney(fcf.FCF), fcf.Interpretation})
 	}
 
-	if cfq, err := client.GetOperatingCashFlowVsNetIncome(ctx, ticker); err != nil {
-		rows = append(rows, row{"OCF / Net Income", "error: " + err.Error(), ""})
+	if cfqErr != nil {
+		rows = append(rows, row{"OCF / Net Income", "error: " + cfqErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Operating Cash Flow", formatMoney(cfq.OperatingCashFlow), ""})
 		rows = append(rows, row{"Net Income", formatMoney(cfq.NetIncome), ""})
 		rows = append(rows, row{"OCF / Net Income", fmt.Sprintf("%.2fx", cfq.Ratio), cfq.Interpretation})
 	}
 
-	if d2e, err := client.GetDebtToEquity(ctx, ticker); err != nil {
-		rows = append(rows, row{"Debt / Equity", "error: " + err.Error(), ""})
+	if d2eErr != nil {
+		rows = append(rows, row{"Debt / Equity", "error: " + d2eErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Debt / Equity", fmt.Sprintf("%.1f%%", d2e.Ratio), d2e.Interpretation})
 	}
 
-	if ev, err := client.GetEVToEBITDA(ctx, ticker); err != nil {
-		rows = append(rows, row{"EV / EBITDA", "error: " + err.Error(), ""})
+	if evErr != nil {
+		rows = append(rows, row{"EV / EBITDA", "error: " + evErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"EV / EBITDA", fmt.Sprintf("%.2fx", ev.Ratio), ev.Interpretation})
 	}

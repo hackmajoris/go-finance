@@ -1409,3 +1409,141 @@ func (c *Client) doFetchPerformance(ctx context.Context, symbol string) (*Perfor
 		FiveYear:  pctSince(now.AddDate(-5, 0, 0)),
 	}, nil
 }
+
+// HealthRating is a coarse read on a company's financial soundness — cash generation,
+// earnings quality, and leverage. It says nothing about whether the stock is cheap or
+// expensive; pair it with ValuationRating for that.
+type HealthRating string
+
+// HealthRating values, from strongest to weakest.
+const (
+	HealthHealthy   HealthRating = "healthy"
+	HealthFair      HealthRating = "fair"
+	HealthWeak      HealthRating = "weak"
+	HealthUnhealthy HealthRating = "unhealthy"
+)
+
+// ClassifyHealth scores financial health from already-fetched indicators — free cash
+// flow sign, operating-cash-flow/net-income quality, and debt-to-equity. Any argument
+// may be nil if that indicator failed to fetch; the rating is based on whatever is
+// available. Compare against sector peers: capital-heavy industries run structurally
+// higher leverage, and that alone shouldn't read as unhealthy.
+func ClassifyHealth(fcf *FreeCashFlow, cfq *CashFlowQuality, d2e *DebtToEquity) (HealthRating, string) {
+	score := 0
+	var notes []string
+
+	if fcf != nil {
+		switch {
+		case fcf.FCF > 0:
+			score++
+			notes = append(notes, "positive free cash flow")
+		case fcf.FCF < 0:
+			score--
+			notes = append(notes, "negative free cash flow")
+		}
+	}
+	if cfq != nil && cfq.NetIncome != 0 {
+		switch {
+		case cfq.Ratio < 0:
+			score--
+			notes = append(notes, "operating cash flow and net income have opposite signs")
+		case cfq.Ratio >= 0.8 && cfq.Ratio <= 1.3:
+			score++
+			notes = append(notes, "earnings well backed by cash")
+		default:
+			notes = append(notes, "cash flow/earnings ratio far from 1x")
+		}
+	}
+	if d2e != nil {
+		switch {
+		case d2e.Ratio < 100:
+			score++
+			notes = append(notes, "equity-funded balance sheet")
+		case d2e.Ratio >= 200:
+			score--
+			notes = append(notes, "high leverage")
+		default:
+			notes = append(notes, "moderate leverage")
+		}
+	}
+
+	if len(notes) == 0 {
+		return HealthFair, "not enough data to assess health — treating as neutral"
+	}
+
+	reason := strings.Join(notes, "; ") + ". Compare against sector peers, not in isolation."
+
+	switch {
+	case score >= 2:
+		return HealthHealthy, reason
+	case score <= -2:
+		return HealthUnhealthy, reason
+	case score == -1:
+		return HealthWeak, reason
+	default:
+		return HealthFair, reason
+	}
+}
+
+// ValuationRating is a coarse read on whether the market price looks cheap or expensive
+// relative to earnings and operating cash flow. It says nothing about the underlying
+// business's soundness; pair it with HealthRating for that.
+type ValuationRating string
+
+// ValuationRating values, from cheapest to most expensive; Unclear when there isn't
+// enough usable data.
+const (
+	ValuationUndervalued ValuationRating = "undervalued"
+	ValuationFair        ValuationRating = "fair"
+	ValuationOvervalued  ValuationRating = "overvalued"
+	ValuationUnclear     ValuationRating = "unclear"
+)
+
+// ClassifyValuation scores valuation from already-fetched indicators — the forward vs.
+// trailing P/E trend and the EV/EBITDA level. Either argument may be nil or carry
+// unavailable figures; the rating is based on whatever is usable. Compare against
+// sector peers: capital-light or high-growth sectors trade structurally higher.
+func ClassifyValuation(pe *PERatio, ev *EVToEBITDA) (ValuationRating, string) {
+	score := 0
+	var notes []string
+
+	if pe != nil && pe.PE > 0 && pe.ForwardPE > 0 {
+		switch {
+		case pe.ForwardPE < pe.PE:
+			score++
+			notes = append(notes, "forward P/E below trailing (earnings expected to grow)")
+		case pe.ForwardPE > pe.PE:
+			score--
+			notes = append(notes, "forward P/E above trailing (earnings expected to shrink)")
+		default:
+			notes = append(notes, "forward P/E flat vs trailing")
+		}
+	}
+	if ev != nil && ev.Ratio > 0 {
+		switch {
+		case ev.Ratio < 10:
+			score++
+			notes = append(notes, "EV/EBITDA below 10x")
+		case ev.Ratio > 15:
+			score--
+			notes = append(notes, "EV/EBITDA above 15x")
+		default:
+			notes = append(notes, "EV/EBITDA in the 10x-15x fair range")
+		}
+	}
+
+	if len(notes) == 0 {
+		return ValuationUnclear, "not enough data (no positive trailing/forward P/E pair or EV/EBITDA figure) to assess valuation"
+	}
+
+	reason := strings.Join(notes, "; ") + ". Compare against sector peers, not an absolute threshold."
+
+	switch {
+	case score >= 1:
+		return ValuationUndervalued, reason
+	case score <= -1:
+		return ValuationOvervalued, reason
+	default:
+		return ValuationFair, reason
+	}
+}

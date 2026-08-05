@@ -181,6 +181,24 @@ ev, err := client.GetEVToEBITDA(ctx, "AAPL")
 // ev.Interpretation → "Above 15x: expensive relative to operating earnings..."
 ```
 
+#### `ClassifyHealth(fcf, cfq, d2e) (HealthRating, string)`
+
+Composite read on financial soundness — cash generation, earnings quality, and leverage — from already-fetched `FreeCashFlow`, `CashFlowQuality`, and `DebtToEquity`. Any argument may be `nil` if that indicator failed to fetch; the rating is based on whatever's available. No network call — pure function over data you already have. Deliberately separate from valuation: a company can be financially healthy and still expensive, or shaky and still "cheap" (value trap).
+
+```go
+health, reason := yahoo.ClassifyHealth(fcf, cfq, d2e)
+// health → yahoo.HealthHealthy | HealthFair | HealthWeak | HealthUnhealthy
+```
+
+#### `ClassifyValuation(pe, ev) (ValuationRating, string)`
+
+Composite read on whether the price looks cheap or expensive relative to earnings and operating cash flow, from already-fetched `PERatio` (forward vs. trailing trend) and `EVToEBITDA` (level). No network call.
+
+```go
+valuation, reason := yahoo.ClassifyValuation(pe, ev)
+// valuation → yahoo.ValuationUndervalued | ValuationFair | ValuationOvervalued | ValuationUnclear
+```
+
 #### `FetchQuotes(ctx, symbols) (map[string]float64, error)`
 
 Fetches current prices for multiple symbols in parallel using the v8 chart endpoint (no crumb required). Returns a `map[string]float64` keyed by both the original and normalised ticker (e.g. both `"BRK B"` and `"BRK-B"`).
@@ -309,6 +327,12 @@ type EVToEBITDA struct {
     Ratio          float64 `json:"ratio"`
     Interpretation string  `json:"interpretation"`
 }
+
+// HealthRating: "healthy" | "fair" | "weak" | "unhealthy"
+type HealthRating string
+
+// ValuationRating: "undervalued" | "fair" | "overvalued" | "unclear"
+type ValuationRating string
 
 type HistoricalBar struct {
     Symbol string  `json:"symbol"`

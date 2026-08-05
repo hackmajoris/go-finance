@@ -1149,6 +1149,108 @@ func TestFetchPerformance(t *testing.T) {
 	})
 }
 
+func TestClassifyHealth(t *testing.T) {
+	tests := []struct {
+		name string
+		fcf  *yahoo.FreeCashFlow
+		cfq  *yahoo.CashFlowQuality
+		d2e  *yahoo.DebtToEquity
+		want yahoo.HealthRating
+	}{
+		{
+			name: "all three signals positive",
+			fcf:  &yahoo.FreeCashFlow{FCF: 100},
+			cfq:  &yahoo.CashFlowQuality{OperatingCashFlow: 110, NetIncome: 100, Ratio: 1.1},
+			d2e:  &yahoo.DebtToEquity{Ratio: 50},
+			want: yahoo.HealthHealthy,
+		},
+		{
+			name: "all three signals negative",
+			fcf:  &yahoo.FreeCashFlow{FCF: -50},
+			cfq:  &yahoo.CashFlowQuality{OperatingCashFlow: -20, NetIncome: 100, Ratio: -0.2},
+			d2e:  &yahoo.DebtToEquity{Ratio: 250},
+			want: yahoo.HealthUnhealthy,
+		},
+		{
+			name: "single negative signal — weak, not unhealthy",
+			fcf:  &yahoo.FreeCashFlow{FCF: -50},
+			want: yahoo.HealthWeak,
+		},
+		{
+			name: "mixed signals cancel out — fair",
+			fcf:  &yahoo.FreeCashFlow{FCF: 100},
+			d2e:  &yahoo.DebtToEquity{Ratio: 250},
+			want: yahoo.HealthFair,
+		},
+		{
+			name: "no data at all — fair (neutral)",
+			want: yahoo.HealthFair,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, reason := yahoo.ClassifyHealth(tc.fcf, tc.cfq, tc.d2e)
+			if got != tc.want {
+				t.Errorf("rating: got %q, want %q (reason: %s)", got, tc.want, reason)
+			}
+			if reason == "" {
+				t.Error("expected a non-empty reason")
+			}
+		})
+	}
+}
+
+func TestClassifyValuation(t *testing.T) {
+	tests := []struct {
+		name string
+		pe   *yahoo.PERatio
+		ev   *yahoo.EVToEBITDA
+		want yahoo.ValuationRating
+	}{
+		{
+			name: "both signals cheap",
+			pe:   &yahoo.PERatio{PE: 20, ForwardPE: 15},
+			ev:   &yahoo.EVToEBITDA{Ratio: 8},
+			want: yahoo.ValuationUndervalued,
+		},
+		{
+			name: "both signals expensive",
+			pe:   &yahoo.PERatio{PE: 20, ForwardPE: 25},
+			ev:   &yahoo.EVToEBITDA{Ratio: 20},
+			want: yahoo.ValuationOvervalued,
+		},
+		{
+			name: "signals disagree — fair",
+			pe:   &yahoo.PERatio{PE: 20, ForwardPE: 15},
+			ev:   &yahoo.EVToEBITDA{Ratio: 20},
+			want: yahoo.ValuationFair,
+		},
+		{
+			name: "no usable data — unclear",
+			pe:   &yahoo.PERatio{PE: 0, ForwardPE: 0},
+			ev:   &yahoo.EVToEBITDA{Ratio: 0},
+			want: yahoo.ValuationUnclear,
+		},
+		{
+			name: "nil arguments — unclear",
+			want: yahoo.ValuationUnclear,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, reason := yahoo.ClassifyValuation(tc.pe, tc.ev)
+			if got != tc.want {
+				t.Errorf("rating: got %q, want %q (reason: %s)", got, tc.want, reason)
+			}
+			if reason == "" {
+				t.Error("expected a non-empty reason")
+			}
+		})
+	}
+}
+
 func errIs(got, target error) bool {
 	for got != nil {
 		if got == target {
