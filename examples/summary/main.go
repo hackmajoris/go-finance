@@ -108,9 +108,15 @@ func main() {
 	fmt.Printf("%s\n\n", ticker)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(w, "METRIC\tVALUE\tNOTES")
-	for _, r := range rows {
-		fmt.Fprintf(w, "%s\t%s\t%s\n", r.metric, r.value, r.note)
+	if _, err := fmt.Fprintln(w, "METRIC\tVALUE\tNOTES"); err != nil {
+		log.Fatal(err)
 	}
-	w.Flush()
+	for _, r := range rows {
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\n", r.metric, r.value, r.note); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		log.Fatal(err)
+	}
 }
