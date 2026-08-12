@@ -3,6 +3,10 @@
 // quality, debt-to-equity, EV/EBITDA, market cap, price/sales, price/book, FCF yield,
 // profit & operating margins, quarterly earnings & revenue growth, cash/debt/net,
 // dividend yield/payout ratio/payout date, 52-week range, and performance returns.
+//
+// Indicators are fetched concurrently. The crumb is warmed with a single sequential
+// call first, so the parallel fan-out only reads the (now-set) crumb — safe for
+// concurrent use — instead of racing to run the handshake many times at once.
 package main
 
 import (
@@ -12,6 +16,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
 	"text/tabwriter"
 
 	"github.com/hackmajoris/go-finance/pkg/yahoo"
@@ -52,21 +57,94 @@ func main() {
 	}
 
 	ctx := context.Background()
+
+	// Warm the crumb with one sequential call before fanning out; this also gives the
+	// Price row. Every parallel call below then finds the crumb already set and only
+	// reads it, avoiding a data race on the lazy handshake.
+	quote, quoteErr := client.GetQuote(ctx, ticker)
+
+	var (
+		pe      *yahoo.PERatio
+		peErr   error
+		fcf     *yahoo.FreeCashFlow
+		fcfErr  error
+		cfq     *yahoo.CashFlowQuality
+		cfqErr  error
+		d2e     *yahoo.DebtToEquity
+		d2eErr  error
+		ev      *yahoo.EVToEBITDA
+		evErr   error
+		mc      *yahoo.MarketCap
+		mcErr   error
+		ps      *yahoo.PriceToSales
+		psErr   error
+		pb      *yahoo.PriceToBook
+		pbErr   error
+		fy      *yahoo.FreeCashFlowYield
+		fyErr   error
+		pm      *yahoo.ProfitMargin
+		pmErr   error
+		om      *yahoo.OperatingMargin
+		omErr   error
+		eg      *yahoo.QuarterlyEarningsGrowth
+		egErr   error
+		rg      *yahoo.QuarterlyRevenueGrowth
+		rgErr   error
+		cash    *yahoo.Cash
+		cashErr error
+		debt    *yahoo.Debt
+		debtErr error
+		dy      *yahoo.DividendYield
+		dyErr   error
+		prr     *yahoo.PayoutRatio
+		prErr   error
+		pd      *yahoo.PayoutDate
+		pdErr   error
+		rng     *yahoo.FiftyTwoWeekRange
+		rngErr  error
+		perf    *yahoo.PerformanceReturns
+		perfErr error
+	)
+
+	var wg sync.WaitGroup
+	run := func(f func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f()
+		}()
+	}
+
+	run(func() { pe, peErr = client.GetPE(ctx, ticker) })
+	run(func() { fcf, fcfErr = client.GetFreeCashFlow(ctx, ticker) })
+	run(func() { cfq, cfqErr = client.GetOperatingCashFlowVsNetIncome(ctx, ticker) })
+	run(func() { d2e, d2eErr = client.GetDebtToEquity(ctx, ticker) })
+	run(func() { ev, evErr = client.GetEVToEBITDA(ctx, ticker) })
+	run(func() { mc, mcErr = client.GetMarketCap(ctx, ticker) })
+	run(func() { ps, psErr = client.GetPriceToSales(ctx, ticker) })
+	run(func() { pb, pbErr = client.GetPriceToBook(ctx, ticker) })
+	run(func() { fy, fyErr = client.GetFreeCashFlowYield(ctx, ticker) })
+	run(func() { pm, pmErr = client.GetProfitMargin(ctx, ticker) })
+	run(func() { om, omErr = client.GetOperatingMargin(ctx, ticker) })
+	run(func() { eg, egErr = client.GetQuarterlyEarningsGrowth(ctx, ticker) })
+	run(func() { rg, rgErr = client.GetQuarterlyRevenueGrowth(ctx, ticker) })
+	run(func() { cash, cashErr = client.GetCash(ctx, ticker) })
+	run(func() { debt, debtErr = client.GetDebt(ctx, ticker) })
+	run(func() { dy, dyErr = client.GetDividendYield(ctx, ticker) })
+	run(func() { prr, prErr = client.GetPayoutRatio(ctx, ticker) })
+	run(func() { pd, pdErr = client.GetPayoutDate(ctx, ticker) })
+	run(func() { rng, rngErr = client.FetchFiftyTwoWeekRange(ctx, ticker) })
+	run(func() { perf, perfErr = client.FetchPerformance(ctx, ticker) })
+
+	wg.Wait()
+
 	var rows []row
 
-	if quote, err := client.GetQuote(ctx, ticker); err != nil {
-		rows = append(rows, row{"Price", "error: " + err.Error(), ""})
+	if quoteErr != nil {
+		rows = append(rows, row{"Price", "error: " + quoteErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Price", fmt.Sprintf("%.2f %s", quote.Price, quote.Currency), ""})
 	}
-
-	// fetched up front (rather than inline in the table build below) so ClassifyHealth
-	// and ClassifyValuation can reuse them without extra requests
-	pe, peErr := client.GetPE(ctx, ticker)
-	fcf, fcfErr := client.GetFreeCashFlow(ctx, ticker)
-	cfq, cfqErr := client.GetOperatingCashFlowVsNetIncome(ctx, ticker)
-	d2e, d2eErr := client.GetDebtToEquity(ctx, ticker)
-	ev, evErr := client.GetEVToEBITDA(ctx, ticker)
 
 	health, healthReason := yahoo.ClassifyHealth(fcf, cfq, d2e)
 	valuation, valuationReason := yahoo.ClassifyValuation(pe, ev)
@@ -106,56 +184,54 @@ func main() {
 		rows = append(rows, row{"EV / EBITDA", fmt.Sprintf("%.2fx", ev.Ratio), ev.Interpretation})
 	}
 
-	if mc, err := client.GetMarketCap(ctx, ticker); err != nil {
-		rows = append(rows, row{"Market Cap", "error: " + err.Error(), ""})
+	if mcErr != nil {
+		rows = append(rows, row{"Market Cap", "error: " + mcErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Market Cap", formatMoney(mc.MarketCap), mc.Interpretation})
 	}
 
-	if ps, err := client.GetPriceToSales(ctx, ticker); err != nil {
-		rows = append(rows, row{"Price / Sales", "error: " + err.Error(), ""})
+	if psErr != nil {
+		rows = append(rows, row{"Price / Sales", "error: " + psErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Price / Sales", fmt.Sprintf("%.2fx", ps.Ratio), ps.Interpretation})
 	}
 
-	if pb, err := client.GetPriceToBook(ctx, ticker); err != nil {
-		rows = append(rows, row{"Price / Book", "error: " + err.Error(), ""})
+	if pbErr != nil {
+		rows = append(rows, row{"Price / Book", "error: " + pbErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Price / Book", fmt.Sprintf("%.2fx", pb.Ratio), pb.Interpretation})
 	}
 
-	if fy, err := client.GetFreeCashFlowYield(ctx, ticker); err != nil {
-		rows = append(rows, row{"FCF Yield", "error: " + err.Error(), ""})
+	if fyErr != nil {
+		rows = append(rows, row{"FCF Yield", "error: " + fyErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"FCF Yield", fmt.Sprintf("%.2f%%", fy.Yield), fy.Interpretation})
 	}
 
-	if pm, err := client.GetProfitMargin(ctx, ticker); err != nil {
-		rows = append(rows, row{"Profit Margin", "error: " + err.Error(), ""})
+	if pmErr != nil {
+		rows = append(rows, row{"Profit Margin", "error: " + pmErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Profit Margin", fmt.Sprintf("%.2f%%", pm.Margin), pm.Interpretation})
 	}
 
-	if om, err := client.GetOperatingMargin(ctx, ticker); err != nil {
-		rows = append(rows, row{"Operating Margin", "error: " + err.Error(), ""})
+	if omErr != nil {
+		rows = append(rows, row{"Operating Margin", "error: " + omErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Operating Margin", fmt.Sprintf("%.2f%%", om.Margin), om.Interpretation})
 	}
 
-	if eg, err := client.GetQuarterlyEarningsGrowth(ctx, ticker); err != nil {
-		rows = append(rows, row{"Q Earnings (YoY)", "error: " + err.Error(), ""})
+	if egErr != nil {
+		rows = append(rows, row{"Q Earnings (YoY)", "error: " + egErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Q Earnings (YoY)", fmt.Sprintf("%+.2f%%", eg.Growth), eg.Interpretation})
 	}
 
-	if rg, err := client.GetQuarterlyRevenueGrowth(ctx, ticker); err != nil {
-		rows = append(rows, row{"Q Revenue (YoY)", "error: " + err.Error(), ""})
+	if rgErr != nil {
+		rows = append(rows, row{"Q Revenue (YoY)", "error: " + rgErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Q Revenue (YoY)", fmt.Sprintf("%+.2f%%", rg.Growth), rg.Interpretation})
 	}
 
-	cash, cashErr := client.GetCash(ctx, ticker)
-	debt, debtErr := client.GetDebt(ctx, ticker)
 	if cashErr != nil {
 		rows = append(rows, row{"Cash", "error: " + cashErr.Error(), ""})
 	} else {
@@ -175,20 +251,20 @@ func main() {
 		rows = append(rows, row{"Net", formatMoney(net), note})
 	}
 
-	if dy, err := client.GetDividendYield(ctx, ticker); err != nil {
-		rows = append(rows, row{"Dividend Yield", "error: " + err.Error(), ""})
+	if dyErr != nil {
+		rows = append(rows, row{"Dividend Yield", "error: " + dyErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Dividend Yield", fmt.Sprintf("%.2f%%", dy.Yield), dy.Interpretation})
 	}
 
-	if pr, err := client.GetPayoutRatio(ctx, ticker); err != nil {
-		rows = append(rows, row{"Payout Ratio", "error: " + err.Error(), ""})
+	if prErr != nil {
+		rows = append(rows, row{"Payout Ratio", "error: " + prErr.Error(), ""})
 	} else {
-		rows = append(rows, row{"Payout Ratio", fmt.Sprintf("%.2f%%", pr.Ratio), pr.Interpretation})
+		rows = append(rows, row{"Payout Ratio", fmt.Sprintf("%.2f%%", prr.Ratio), prr.Interpretation})
 	}
 
-	if pd, err := client.GetPayoutDate(ctx, ticker); err != nil {
-		rows = append(rows, row{"Payout Date", "error: " + err.Error(), ""})
+	if pdErr != nil {
+		rows = append(rows, row{"Payout Date", "error: " + pdErr.Error(), ""})
 	} else {
 		val := "—"
 		if !pd.Date.IsZero() {
@@ -197,14 +273,14 @@ func main() {
 		rows = append(rows, row{"Payout Date", val, pd.Interpretation})
 	}
 
-	if rng, err := client.FetchFiftyTwoWeekRange(ctx, ticker); err != nil {
-		rows = append(rows, row{"52-Week Range", "error: " + err.Error(), ""})
+	if rngErr != nil {
+		rows = append(rows, row{"52-Week Range", "error: " + rngErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"52-Week Range", fmt.Sprintf("%.2f - %.2f (%.0f%%)", rng.Low, rng.High, rng.Pct*100), ""})
 	}
 
-	if perf, err := client.FetchPerformance(ctx, ticker); err != nil {
-		rows = append(rows, row{"Performance", "error: " + err.Error(), ""})
+	if perfErr != nil {
+		rows = append(rows, row{"Performance", "error: " + perfErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"YTD", fmt.Sprintf("%+.2f%%", perf.YTD), ""})
 		rows = append(rows, row{"1-Year", fmt.Sprintf("%+.2f%%", perf.OneYear), ""})
