@@ -797,6 +797,599 @@ func (c *Client) fetchEVToEBITDA(ctx context.Context, symbol string) (*float64, 
 	return &ratio, nil
 }
 
+// rawValue matches Yahoo's {"raw": <number>, "fmt": ...} field wrapper; only Raw is read.
+type rawValue struct {
+	Raw float64 `json:"raw"`
+}
+
+// fetchQuoteSummary fetches the given quoteSummary modules for a symbol and decodes the
+// first result into out (requires crumb). It returns false, nil (leaving out untouched)
+// when Yahoo has no data for the symbol (404 or empty result), so callers can map that to
+// ErrTickerNotFound while keeping it distinct from transport/API errors.
+func (c *Client) fetchQuoteSummary(ctx context.Context, symbol, modules string, out interface{}) (bool, error) {
+	u, err := url.Parse(fmt.Sprintf("%s/v10/finance/quoteSummary/%s", c.baseURL, symbol))
+	if err != nil {
+		return false, fmt.Errorf("parsing url: %w", err)
+	}
+	q := u.Query()
+	q.Set("modules", modules)
+	q.Set("crumb", c.crumb)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false, fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("executing request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)
+	}
+
+	var payload struct {
+		QuoteSummary struct {
+			Result []json.RawMessage `json:"result"`
+			Error  interface{}       `json:"error"`
+		} `json:"quoteSummary"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return false, fmt.Errorf("decoding response: %w", err)
+	}
+	if payload.QuoteSummary.Error != nil {
+		return false, fmt.Errorf("%w: %v", ErrAPIError, payload.QuoteSummary.Error)
+	}
+	if len(payload.QuoteSummary.Result) == 0 {
+		return false, nil
+	}
+	if err := json.Unmarshal(payload.QuoteSummary.Result[0], out); err != nil {
+		return false, fmt.Errorf("decoding result: %w", err)
+	}
+	return true, nil
+}
+
+// MarketCap holds the total market value of a company's outstanding shares.
+type MarketCap struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	MarketCap      float64 `json:"marketCap"`      // shares outstanding × price, in the reporting currency
+	Interpretation string  `json:"interpretation"` // plain-language read of the size bucket
+}
+
+func describeMarketCap(v float64) string {
+	switch {
+	case v >= 2e11:
+		return "Mega cap (≥$200B): among the largest, most liquid companies — typically stable but slower-growing."
+	case v >= 1e10:
+		return "Large cap ($10B–$200B): established company, generally lower volatility than smaller peers."
+	case v >= 2e9:
+		return "Mid cap ($2B–$10B): a balance of growth potential and established footing."
+	case v > 0:
+		return "Small cap (<$2B): higher growth potential but typically more volatile and less liquid."
+	default:
+		return "No market cap reported for this symbol."
+	}
+}
+
+// GetMarketCap returns the market capitalization for a stock ticker.
+func (c *Client) GetMarketCap(ctx context.Context, ticker string) (*MarketCap, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		SummaryDetail struct {
+			MarketCap rawValue `json:"marketCap"`
+		} `json:"summaryDetail"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "summaryDetail", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	v := out.SummaryDetail.MarketCap.Raw
+	return &MarketCap{Symbol: ticker, MarketCap: v, Interpretation: describeMarketCap(v)}, nil
+}
+
+// PriceToSales holds the trailing price/sales ratio for a symbol.
+type PriceToSales struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Ratio          float64 `json:"ratio"`          // price / trailing twelve-month sales per share
+	Interpretation string  `json:"interpretation"` // plain-language read; compare against sector peers
+}
+
+func describePriceToSales(r float64) string {
+	switch {
+	case r <= 0:
+		return "No price/sales ratio reported for this symbol."
+	case r < 1:
+		return "Below 1x: valued at less than a year of sales — often cheap, but check why (thin margins, shrinking revenue). Compare against sector peers."
+	case r <= 3:
+		return "Roughly 1x–3x: a moderate sales multiple for a typical business. Read against sector peers, not in isolation."
+	default:
+		return "Above 3x: a premium to sales, pricing in growth or high margins. Rich for slow growers, normal for software. Compare against sector peers."
+	}
+}
+
+// GetPriceToSales returns the trailing price/sales ratio for a stock ticker.
+func (c *Client) GetPriceToSales(ctx context.Context, ticker string) (*PriceToSales, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		SummaryDetail struct {
+			PriceToSales rawValue `json:"priceToSalesTrailing12Months"`
+		} `json:"summaryDetail"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "summaryDetail", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	r := out.SummaryDetail.PriceToSales.Raw
+	return &PriceToSales{Symbol: ticker, Ratio: r, Interpretation: describePriceToSales(r)}, nil
+}
+
+// PriceToBook holds the price/book ratio for a symbol.
+type PriceToBook struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Ratio          float64 `json:"ratio"`          // price / book value per share
+	Interpretation string  `json:"interpretation"` // plain-language read; compare against sector peers
+}
+
+func describePriceToBook(r float64) string {
+	switch {
+	case r <= 0:
+		return "No price/book ratio reported (or negative book value) for this symbol."
+	case r < 1:
+		return "Below 1x: trading under book value — potentially undervalued, or the market doubts asset quality. Common for banks and asset-heavy firms; investigate before reading as a bargain."
+	case r <= 3:
+		return "Roughly 1x–3x: a typical book multiple. Compare against sector peers."
+	default:
+		return "Above 3x: valued well above net assets, pricing in intangibles or growth. Normal for asset-light businesses. Compare against sector peers."
+	}
+}
+
+// GetPriceToBook returns the price/book ratio for a stock ticker.
+func (c *Client) GetPriceToBook(ctx context.Context, ticker string) (*PriceToBook, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		DefaultKeyStatistics struct {
+			PriceToBook rawValue `json:"priceToBook"`
+		} `json:"defaultKeyStatistics"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "defaultKeyStatistics", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	r := out.DefaultKeyStatistics.PriceToBook.Raw
+	return &PriceToBook{Symbol: ticker, Ratio: r, Interpretation: describePriceToBook(r)}, nil
+}
+
+// FreeCashFlowYield holds trailing free cash flow expressed as a yield on market cap.
+// Yield is 0 when MarketCap is 0 (division guarded).
+type FreeCashFlowYield struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	FCF            float64 `json:"fcf"`            // trailing twelve-month free cash flow
+	MarketCap      float64 `json:"marketCap"`      // market capitalization
+	Yield          float64 `json:"yield"`          // FCF / MarketCap × 100, as a percentage
+	Interpretation string  `json:"interpretation"` // plain-language read of the yield
+}
+
+func describeFreeCashFlowYield(yield, marketCap float64) string {
+	switch {
+	case marketCap == 0:
+		return "Market cap is zero or unavailable: free cash flow yield cannot be computed."
+	case yield < 0:
+		return "Negative FCF yield: the business burns cash. Normal for early-growth or heavy-capex phases, a warning if sustained."
+	case yield < 2:
+		return "Below 2%: low cash return relative to market value — expensive on a cash basis, or reinvesting heavily for growth."
+	case yield <= 5:
+		return "Roughly 2%–5%: a moderate cash yield for an established business."
+	default:
+		return "Above 5%: high cash generation relative to market value — cheap on a cash basis, provided the FCF is sustainable."
+	}
+}
+
+// GetFreeCashFlowYield returns trailing free cash flow as a yield on market cap for a stock ticker.
+func (c *Client) GetFreeCashFlowYield(ctx context.Context, ticker string) (*FreeCashFlowYield, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		FinancialData struct {
+			FreeCashflow rawValue `json:"freeCashflow"`
+		} `json:"financialData"`
+		SummaryDetail struct {
+			MarketCap rawValue `json:"marketCap"`
+		} `json:"summaryDetail"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData,summaryDetail", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	fcf := out.FinancialData.FreeCashflow.Raw
+	mc := out.SummaryDetail.MarketCap.Raw
+	yield := 0.0
+	if mc != 0 {
+		yield = fcf / mc * 100
+	}
+	return &FreeCashFlowYield{Symbol: ticker, FCF: fcf, MarketCap: mc, Yield: yield, Interpretation: describeFreeCashFlowYield(yield, mc)}, nil
+}
+
+// ProfitMargin holds the net profit margin (percentage) for a symbol.
+type ProfitMargin struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Margin         float64 `json:"margin"`         // net income / revenue, as a percentage
+	Interpretation string  `json:"interpretation"` // plain-language read; compare against sector peers
+}
+
+func describeProfitMargin(pct float64) string {
+	switch {
+	case pct < 0:
+		return "Negative net margin: unprofitable at the bottom line. Common for early-growth firms, a warning if sustained."
+	case pct < 5:
+		return "Thin net margin (<5%): little profit per dollar of sales — typical for low-margin sectors (retail, distribution). Compare against sector peers."
+	case pct <= 20:
+		return "Moderate net margin (5%–20%): a solid profitability range for most businesses."
+	default:
+		return "High net margin (>20%): strong pricing power or a capital-light model. Compare against sector peers."
+	}
+}
+
+// GetProfitMargin returns the net profit margin for a stock ticker.
+func (c *Client) GetProfitMargin(ctx context.Context, ticker string) (*ProfitMargin, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		FinancialData struct {
+			ProfitMargins rawValue `json:"profitMargins"`
+		} `json:"financialData"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	pct := out.FinancialData.ProfitMargins.Raw * 100
+	return &ProfitMargin{Symbol: ticker, Margin: pct, Interpretation: describeProfitMargin(pct)}, nil
+}
+
+// OperatingMargin holds the operating margin (percentage) for a symbol.
+type OperatingMargin struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Margin         float64 `json:"margin"`         // operating income / revenue, as a percentage
+	Interpretation string  `json:"interpretation"` // plain-language read; compare against sector peers
+}
+
+func describeOperatingMargin(pct float64) string {
+	switch {
+	case pct < 0:
+		return "Negative operating margin: core operations lose money before interest and tax. A warning unless in an early-growth phase."
+	case pct < 10:
+		return "Thin operating margin (<10%): limited profit from core operations. Compare against sector peers."
+	case pct <= 25:
+		return "Healthy operating margin (10%–25%): core operations are solidly profitable."
+	default:
+		return "High operating margin (>25%): efficient core operations with strong pricing power. Compare against sector peers."
+	}
+}
+
+// GetOperatingMargin returns the operating margin for a stock ticker.
+func (c *Client) GetOperatingMargin(ctx context.Context, ticker string) (*OperatingMargin, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		FinancialData struct {
+			OperatingMargins rawValue `json:"operatingMargins"`
+		} `json:"financialData"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	pct := out.FinancialData.OperatingMargins.Raw * 100
+	return &OperatingMargin{Symbol: ticker, Margin: pct, Interpretation: describeOperatingMargin(pct)}, nil
+}
+
+// describeYoYGrowth renders a plain-language year-over-year growth reading for label.
+func describeYoYGrowth(pct float64, label string) string {
+	switch {
+	case pct > 0:
+		return fmt.Sprintf("%s grew %.1f%% year over year.", label, pct)
+	case pct < 0:
+		return fmt.Sprintf("%s fell %.1f%% year over year.", label, -pct)
+	default:
+		return label + " was flat year over year (or no figure reported)."
+	}
+}
+
+// QuarterlyEarningsGrowth holds the most recent quarter's year-over-year earnings growth (percentage).
+type QuarterlyEarningsGrowth struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Growth         float64 `json:"growth"`         // latest quarter earnings vs the year-ago quarter, as a percentage
+	Interpretation string  `json:"interpretation"` // plain-language read of the growth
+}
+
+// GetQuarterlyEarningsGrowth returns the latest quarter's year-over-year earnings growth for a stock ticker.
+func (c *Client) GetQuarterlyEarningsGrowth(ctx context.Context, ticker string) (*QuarterlyEarningsGrowth, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		DefaultKeyStatistics struct {
+			EarningsQuarterlyGrowth rawValue `json:"earningsQuarterlyGrowth"`
+		} `json:"defaultKeyStatistics"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "defaultKeyStatistics", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	pct := out.DefaultKeyStatistics.EarningsQuarterlyGrowth.Raw * 100
+	return &QuarterlyEarningsGrowth{Symbol: ticker, Growth: pct, Interpretation: describeYoYGrowth(pct, "Quarterly earnings")}, nil
+}
+
+// QuarterlyRevenueGrowth holds the most recent quarter's year-over-year revenue growth (percentage).
+type QuarterlyRevenueGrowth struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Growth         float64 `json:"growth"`         // latest quarter revenue vs the year-ago quarter, as a percentage
+	Interpretation string  `json:"interpretation"` // plain-language read of the growth
+}
+
+// GetQuarterlyRevenueGrowth returns the latest quarter's year-over-year revenue growth for a stock ticker.
+func (c *Client) GetQuarterlyRevenueGrowth(ctx context.Context, ticker string) (*QuarterlyRevenueGrowth, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		FinancialData struct {
+			RevenueGrowth rawValue `json:"revenueGrowth"`
+		} `json:"financialData"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	pct := out.FinancialData.RevenueGrowth.Raw * 100
+	return &QuarterlyRevenueGrowth{Symbol: ticker, Growth: pct, Interpretation: describeYoYGrowth(pct, "Quarterly revenue")}, nil
+}
+
+// Cash holds total cash and short-term investments on the balance sheet.
+type Cash struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Cash           float64 `json:"cash"`           // total cash and equivalents, in the reporting currency
+	Interpretation string  `json:"interpretation"` // plain-language note
+}
+
+// GetCash returns total cash and equivalents for a stock ticker.
+func (c *Client) GetCash(ctx context.Context, ticker string) (*Cash, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		FinancialData struct {
+			TotalCash rawValue `json:"totalCash"`
+		} `json:"financialData"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	v := out.FinancialData.TotalCash.Raw
+	return &Cash{Symbol: ticker, Cash: v, Interpretation: "Total cash and short-term investments on the balance sheet. Pair with Debt for the net position."}, nil
+}
+
+// Debt holds total debt (short- and long-term borrowings) on the balance sheet.
+type Debt struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Debt           float64 `json:"debt"`           // total debt, in the reporting currency
+	Interpretation string  `json:"interpretation"` // plain-language note
+}
+
+// GetDebt returns total debt for a stock ticker.
+func (c *Client) GetDebt(ctx context.Context, ticker string) (*Debt, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		FinancialData struct {
+			TotalDebt rawValue `json:"totalDebt"`
+		} `json:"financialData"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	v := out.FinancialData.TotalDebt.Raw
+	return &Debt{Symbol: ticker, Debt: v, Interpretation: "Total short- and long-term borrowings on the balance sheet. Pair with Cash for the net position and read against cash flow strength."}, nil
+}
+
+// DividendYield holds the forward dividend yield (percentage) for a symbol.
+// Yield is 0 for companies that pay no dividend — a valid state, not an error.
+type DividendYield struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Yield          float64 `json:"yield"`          // annual dividend / price, as a percentage
+	Interpretation string  `json:"interpretation"` // plain-language read of the yield
+}
+
+func describeDividendYield(pct float64) string {
+	switch {
+	case pct <= 0:
+		return "No dividend: the company returns no cash to shareholders via dividends (it may still buy back stock or reinvest)."
+	case pct < 2:
+		return "Low yield (<2%): modest income, often paired with reinvestment for growth."
+	case pct <= 5:
+		return "Moderate yield (2%–5%): a typical income range. Check the payout ratio for sustainability."
+	default:
+		return "High yield (>5%): attractive income, but verify sustainability — an unusually high yield can signal a depressed price or an at-risk payout."
+	}
+}
+
+// GetDividendYield returns the dividend yield for a stock ticker. A zero yield (no dividend) is valid, not an error.
+func (c *Client) GetDividendYield(ctx context.Context, ticker string) (*DividendYield, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		SummaryDetail struct {
+			DividendYield rawValue `json:"dividendYield"`
+		} `json:"summaryDetail"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "summaryDetail", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	pct := out.SummaryDetail.DividendYield.Raw * 100
+	return &DividendYield{Symbol: ticker, Yield: pct, Interpretation: describeDividendYield(pct)}, nil
+}
+
+// PayoutRatio holds the dividend payout ratio (percentage) for a symbol.
+// Ratio is 0 for companies that pay no dividend — a valid state, not an error.
+type PayoutRatio struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	Ratio          float64 `json:"ratio"`          // dividends / earnings, as a percentage
+	Interpretation string  `json:"interpretation"` // plain-language read of the ratio
+}
+
+func describePayoutRatio(pct float64) string {
+	switch {
+	case pct <= 0:
+		return "No dividend payout (or no positive earnings to measure against)."
+	case pct < 60:
+		return "Comfortable payout (<60%): dividends are well covered by earnings, leaving room to reinvest and to sustain the payout in a downturn."
+	case pct <= 100:
+		return "High payout (60%–100%): most earnings go to dividends, leaving little buffer. Sustainable only while earnings hold."
+	default:
+		return "Payout above 100%: paying out more than it earns — funded from reserves or debt. Not sustainable indefinitely; watch for a cut."
+	}
+}
+
+// GetPayoutRatio returns the dividend payout ratio for a stock ticker. A zero ratio (no dividend) is valid, not an error.
+func (c *Client) GetPayoutRatio(ctx context.Context, ticker string) (*PayoutRatio, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		SummaryDetail struct {
+			PayoutRatio rawValue `json:"payoutRatio"`
+		} `json:"summaryDetail"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "summaryDetail", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	pct := out.SummaryDetail.PayoutRatio.Raw * 100
+	return &PayoutRatio{Symbol: ticker, Ratio: pct, Interpretation: describePayoutRatio(pct)}, nil
+}
+
+// PayoutDate holds the next (or most recent) dividend payment date for a symbol.
+// Date is the zero time when Yahoo reports no dividend date.
+type PayoutDate struct {
+	Symbol         string    `json:"symbol"`         // Yahoo Finance ticker
+	Date           time.Time `json:"date"`           // dividend payment date; zero when none is known
+	Interpretation string    `json:"interpretation"` // plain-language note
+}
+
+func describePayoutDate(t time.Time) string {
+	if t.IsZero() {
+		return "No dividend payment date reported — the company may not pay a dividend."
+	}
+	return "Scheduled dividend payment date. Buy before the ex-dividend date to be eligible for the next payment."
+}
+
+// GetPayoutDate returns the dividend payment date for a stock ticker. A missing date (no dividend) is valid, not an error.
+func (c *Client) GetPayoutDate(ctx context.Context, ticker string) (*PayoutDate, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		CalendarEvents struct {
+			DividendDate rawValue `json:"dividendDate"`
+		} `json:"calendarEvents"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "calendarEvents", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	var d time.Time
+	if raw := out.CalendarEvents.DividendDate.Raw; raw > 0 {
+		d = time.Unix(int64(raw), 0).UTC()
+	}
+	return &PayoutDate{Symbol: ticker, Date: d, Interpretation: describePayoutDate(d)}, nil
+}
+
 // GetMonthlyBar returns the OHLC data for a symbol in a given month. Forex pairs like "USD-EUR" are resolved automatically.
 func (c *Client) GetMonthlyBar(ctx context.Context, ticker string, year, month int) (*HistoricalBar, error) {
 	if c.crumb == "" {
