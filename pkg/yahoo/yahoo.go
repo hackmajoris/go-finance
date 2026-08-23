@@ -1862,10 +1862,14 @@ func (c *Client) doFetchFiftyTwoWeekRange(ctx context.Context, symbol string) (*
 // A period is 0 when the symbol has no trading history that far back (e.g. a recent IPO).
 type PerformanceReturns struct {
 	Symbol    string  `json:"symbol"`    // Yahoo Finance ticker
+	Today     float64 `json:"today"`     // % change since the previous close
+	OneWeek   float64 `json:"oneWeek"`   // % change over the trailing 1 week
+	OneMonth  float64 `json:"oneMonth"`  // % change over the trailing 1 month
 	YTD       float64 `json:"ytd"`       // % change since Jan 1 of the current year
 	OneYear   float64 `json:"oneYear"`   // % change over the trailing 1 year
 	ThreeYear float64 `json:"threeYear"` // % change over the trailing 3 years
 	FiveYear  float64 `json:"fiveYear"`  // % change over the trailing 5 years
+	TenYear   float64 `json:"tenYear"`   // % change over the trailing 10 years
 }
 
 type chartHistoryResponse struct {
@@ -1885,9 +1889,9 @@ type chartHistoryResponse struct {
 	} `json:"chart"`
 }
 
-// fetchPriceHistory fetches 5 years of daily closes for a symbol (no crumb required).
+// fetchPriceHistory fetches 10 years of daily closes for a symbol (no crumb required).
 func (c *Client) fetchPriceHistory(ctx context.Context, symbol string) (*chartHistoryResponse, error) {
-	rawURL := fmt.Sprintf("%s/v8/finance/chart/%s?interval=1d&range=5y", c.v8BaseURL, symbol)
+	rawURL := fmt.Sprintf("%s/v8/finance/chart/%s?interval=1d&range=10y", c.v8BaseURL, symbol)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
@@ -1932,9 +1936,10 @@ func closeAtOrBefore(timestamps []int64, closes []float64, target time.Time) (fl
 	return price, found
 }
 
-// FetchPerformance returns YTD, 1-year, 3-year, and 5-year percentage price change for a
-// ticker using the v8 chart endpoint — no crumb or consent flow required. Forex pairs like
-// "USD-EUR" are resolved automatically. A period is 0 when history doesn't reach that far back.
+// FetchPerformance returns today, 1-week, 1-month, YTD, 1-year, 3-year, 5-year, and 10-year
+// percentage price change for a ticker using the v8 chart endpoint — no crumb or consent flow
+// required. Forex pairs like "USD-EUR" are resolved automatically. A period is 0 when history
+// doesn't reach that far back.
 func (c *Client) FetchPerformance(ctx context.Context, ticker string) (*PerformanceReturns, error) {
 	perf, err := c.doFetchPerformance(ctx, NormalizeTicker(ticker))
 	if err != nil {
@@ -1996,10 +2001,14 @@ func (c *Client) doFetchPerformance(ctx context.Context, symbol string) (*Perfor
 	}
 
 	return &PerformanceReturns{
+		Today:     pctSince(now.AddDate(0, 0, -1)),
+		OneWeek:   pctSince(now.AddDate(0, 0, -7)),
+		OneMonth:  pctSince(now.AddDate(0, -1, 0)),
 		YTD:       pctSince(time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)),
 		OneYear:   pctSince(now.AddDate(-1, 0, 0)),
 		ThreeYear: pctSince(now.AddDate(-3, 0, 0)),
 		FiveYear:  pctSince(now.AddDate(-5, 0, 0)),
+		TenYear:   pctSince(now.AddDate(-10, 0, 0)),
 	}, nil
 }
 

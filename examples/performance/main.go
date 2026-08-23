@@ -1,4 +1,4 @@
-// Command performance prints YTD, 1-year, 3-year, and 5-year % price change for a ticker.
+// Command performance prints today, 1-week, 1-month, YTD, 1-year, 3-year, 5-year, and 10-year % price change for a ticker.
 package main
 
 import (

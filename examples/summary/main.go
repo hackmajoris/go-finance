@@ -282,10 +282,14 @@ func main() {
 	if perfErr != nil {
 		rows = append(rows, row{"Performance", "error: " + perfErr.Error(), ""})
 	} else {
+		rows = append(rows, row{"Today", fmt.Sprintf("%+.2f%%", perf.Today), ""})
+		rows = append(rows, row{"1-Week", fmt.Sprintf("%+.2f%%", perf.OneWeek), ""})
+		rows = append(rows, row{"1-Month", fmt.Sprintf("%+.2f%%", perf.OneMonth), ""})
 		rows = append(rows, row{"YTD", fmt.Sprintf("%+.2f%%", perf.YTD), ""})
 		rows = append(rows, row{"1-Year", fmt.Sprintf("%+.2f%%", perf.OneYear), ""})
 		rows = append(rows, row{"3-Year", fmt.Sprintf("%+.2f%%", perf.ThreeYear), ""})
 		rows = append(rows, row{"5-Year", fmt.Sprintf("%+.2f%%", perf.FiveYear), ""})
+		rows = append(rows, row{"10-Year", fmt.Sprintf("%+.2f%%", perf.TenYear), ""})
 	}
 
 	fmt.Printf("%s\n\n", ticker)

@@ -1048,18 +1048,26 @@ func historyPayload(current float64, points map[time.Time]float64) interface{} {
 
 func TestFetchPerformance(t *testing.T) {
 	now := time.Now().UTC()
+	todayTarget := now.AddDate(0, 0, -1)
+	oneWeekTarget := now.AddDate(0, 0, -7)
+	oneMonthTarget := now.AddDate(0, -1, 0)
 	ytdTarget := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
 	oneYearTarget := now.AddDate(-1, 0, 0)
 	threeYearTarget := now.AddDate(-3, 0, 0)
 	fiveYearTarget := now.AddDate(-5, 0, 0)
+	tenYearTarget := now.AddDate(-10, 0, 0)
 
 	t.Run("happy path", func(t *testing.T) {
-		current, five, three, one, ytd := 120.0, 50.0, 80.0, 90.0, 95.0
+		current, ten, five, three, one, ytd, month, week, yesterday := 120.0, 40.0, 50.0, 80.0, 90.0, 95.0, 105.0, 110.0, 118.0
 		payload := historyPayload(current, map[time.Time]float64{
+			tenYearTarget:   ten,
 			fiveYearTarget:  five,
 			threeYearTarget: three,
 			oneYearTarget:   one,
 			ytdTarget:       ytd,
+			oneMonthTarget:  month,
+			oneWeekTarget:   week,
+			todayTarget:     yesterday,
 		})
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_ = json.NewEncoder(w).Encode(payload)
@@ -1076,10 +1084,23 @@ func TestFetchPerformance(t *testing.T) {
 			t.Errorf("symbol: got %q, want %q", got.Symbol, "AAPL")
 		}
 		// computed via variables (not constants) to match the runtime float64 rounding the library does
+		wantToday := (current - yesterday) / yesterday * 100
+		wantOneWeek := (current - week) / week * 100
+		wantOneMonth := (current - month) / month * 100
 		wantYTD := (current - ytd) / ytd * 100
 		wantOneYear := (current - one) / one * 100
 		wantThreeYear := (current - three) / three * 100
 		wantFiveYear := (current - five) / five * 100
+		wantTenYear := (current - ten) / ten * 100
+		if got.Today != wantToday {
+			t.Errorf("today: got %f, want %f", got.Today, wantToday)
+		}
+		if got.OneWeek != wantOneWeek {
+			t.Errorf("oneWeek: got %f, want %f", got.OneWeek, wantOneWeek)
+		}
+		if got.OneMonth != wantOneMonth {
+			t.Errorf("oneMonth: got %f, want %f", got.OneMonth, wantOneMonth)
+		}
 		if got.YTD != wantYTD {
 			t.Errorf("ytd: got %f, want %f", got.YTD, wantYTD)
 		}
@@ -1091,6 +1112,9 @@ func TestFetchPerformance(t *testing.T) {
 		}
 		if got.FiveYear != wantFiveYear {
 			t.Errorf("fiveYear: got %f, want %f", got.FiveYear, wantFiveYear)
+		}
+		if got.TenYear != wantTenYear {
+			t.Errorf("tenYear: got %f, want %f", got.TenYear, wantTenYear)
 		}
 	})
 
