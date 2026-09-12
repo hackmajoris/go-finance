@@ -12,6 +12,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -254,11 +255,12 @@ func (c *Client) GetQuote(ctx context.Context, ticker string) (*Quote, error) {
 }
 
 type v7QuoteResult struct {
-	Symbol             string  `json:"symbol"`
-	RegularMarketPrice float64 `json:"regularMarketPrice"`
-	Currency           string  `json:"currency"`
-	TrailingPE         float64 `json:"trailingPE"`
-	ForwardPE          float64 `json:"forwardPE"`
+	Symbol               string  `json:"symbol"`
+	RegularMarketPrice   float64 `json:"regularMarketPrice"`
+	Currency             string  `json:"currency"`
+	TrailingPE           float64 `json:"trailingPE"`
+	ForwardPE            float64 `json:"forwardPE"`
+	AverageAnalystRating string  `json:"averageAnalystRating"`
 }
 
 // fetchV7Quote fetches the raw v7 quote result for a symbol (requires crumb).
@@ -374,6 +376,47 @@ func (c *Client) GetPE(ctx context.Context, ticker string) (*PERatio, error) {
 		ForwardPE:      r.ForwardPE,
 		Interpretation: describePE(r.TrailingPE, r.ForwardPE),
 	}, nil
+}
+
+// AnalystRating holds Yahoo's average analyst recommendation for a symbol.
+// Score runs 1 (Strong Buy) to 5 (Sell); Rating is the plain-English label
+// Yahoo derives from it (e.g. "Buy").
+type AnalystRating struct {
+	Symbol string  `json:"symbol"` // Yahoo Finance ticker
+	Score  float64 `json:"score"`  // 1 (Strong Buy) – 5 (Sell)
+	Rating string  `json:"rating"` // e.g. "Buy"
+}
+
+// GetAnalystRating returns Yahoo's average analyst recommendation for a stock ticker.
+func (c *Client) GetAnalystRating(ctx context.Context, ticker string) (*AnalystRating, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	r, err := c.fetchV7Quote(ctx, ticker)
+	if err != nil {
+		return nil, err
+	}
+	if r == nil {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+
+	// Empty AverageAnalystRating means the ticker exists but has no analyst
+	// coverage (common for small caps and foreign listings) — not an error.
+	score, rating := parseAnalystRating(r.AverageAnalystRating)
+	return &AnalystRating{Symbol: ticker, Score: score, Rating: rating}, nil
+}
+
+// parseAnalystRating splits Yahoo's "2.2 - Buy" format into its numeric score and label.
+func parseAnalystRating(s string) (float64, string) {
+	score, rating, found := strings.Cut(s, " - ")
+	if !found {
+		return 0, s
+	}
+	f, _ := strconv.ParseFloat(score, 64)
+	return f, rating
 }
 
 // FreeCashFlow holds the trailing twelve-month free cash flow for a symbol.

@@ -108,6 +108,8 @@ func main() {
 		sectorErr error
 		bench     *yahoo.SectorBenchmark
 		benchErr  error
+		rating    *yahoo.AnalystRating
+		ratingErr error
 	)
 
 	var wg sync.WaitGroup
@@ -141,6 +143,7 @@ func main() {
 	run(func() { perf, perfErr = client.FetchPerformance(ctx, ticker) })
 	run(func() { sector, sectorErr = client.GetSector(ctx, ticker) })
 	run(func() { bench, benchErr = client.GetSectorBenchmark(ctx, ticker) })
+	run(func() { rating, ratingErr = client.GetAnalystRating(ctx, ticker) })
 
 	wg.Wait()
 
@@ -156,6 +159,14 @@ func main() {
 		rows = append(rows, row{"Sector", "error: " + sectorErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Sector", sector.Sector, ""})
+	}
+
+	if ratingErr != nil {
+		rows = append(rows, row{"Avg. Analyst Rating", "error: " + ratingErr.Error(), ""})
+	} else if rating.Rating == "" {
+		rows = append(rows, row{"Avg. Analyst Rating", "no analyst coverage", ""})
+	} else {
+		rows = append(rows, row{"Avg. Analyst Rating", rating.Rating, ""})
 	}
 
 	health, healthReason := yahoo.ClassifyHealth(fcf, cfq, d2e)

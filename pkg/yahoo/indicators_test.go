@@ -200,6 +200,77 @@ func TestGetSectorBenchmark(t *testing.T) {
 	}
 }
 
+func TestGetAnalystRating(t *testing.T) {
+	tests := []struct {
+		name       string
+		handler    http.HandlerFunc
+		wantScore  float64
+		wantRating string
+		wantErr    error
+	}{
+		{
+			name: "happy path",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"quoteResponse": map[string]interface{}{
+						"result": []map[string]interface{}{
+							{"symbol": "AAPL", "averageAnalystRating": "2.2 - Buy"},
+						},
+						"error": nil,
+					},
+				})
+			},
+			wantScore:  2.2,
+			wantRating: "Buy",
+		},
+		{
+			name: "no analyst coverage — ticker exists, rating field empty",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"quoteResponse": map[string]interface{}{
+						"result": []map[string]interface{}{
+							{"symbol": "ZIM", "averageAnalystRating": ""},
+						},
+						"error": nil,
+					},
+				})
+			},
+			wantScore:  0,
+			wantRating: "",
+		},
+		{
+			name: "not found — empty result",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"quoteResponse": map[string]interface{}{"result": []interface{}{}, "error": nil},
+				})
+			},
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name:    "http error status",
+			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
+			wantErr: yahoo.ErrAPIError,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+			got, err := newTestClient(t, srv).GetAnalystRating(context.Background(), "AAPL")
+			if !checkErr(t, err, tc.wantErr) {
+				return
+			}
+			if got.Score != tc.wantScore {
+				t.Errorf("score: got %f, want %f", got.Score, tc.wantScore)
+			}
+			if got.Rating != tc.wantRating {
+				t.Errorf("rating: got %q, want %q", got.Rating, tc.wantRating)
+			}
+		})
+	}
+}
+
 func TestGetSectorBenchmark_NoPeerData(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
