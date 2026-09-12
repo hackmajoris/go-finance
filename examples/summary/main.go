@@ -64,46 +64,48 @@ func main() {
 	quote, quoteErr := client.GetQuote(ctx, ticker)
 
 	var (
-		pe      *yahoo.PERatio
-		peErr   error
-		fcf     *yahoo.FreeCashFlow
-		fcfErr  error
-		cfq     *yahoo.CashFlowQuality
-		cfqErr  error
-		d2e     *yahoo.DebtToEquity
-		d2eErr  error
-		ev      *yahoo.EVToEBITDA
-		evErr   error
-		mc      *yahoo.MarketCap
-		mcErr   error
-		ps      *yahoo.PriceToSales
-		psErr   error
-		pb      *yahoo.PriceToBook
-		pbErr   error
-		fy      *yahoo.FreeCashFlowYield
-		fyErr   error
-		pm      *yahoo.ProfitMargin
-		pmErr   error
-		om      *yahoo.OperatingMargin
-		omErr   error
-		eg      *yahoo.QuarterlyEarningsGrowth
-		egErr   error
-		rg      *yahoo.QuarterlyRevenueGrowth
-		rgErr   error
-		cash    *yahoo.Cash
-		cashErr error
-		debt    *yahoo.Debt
-		debtErr error
-		dy      *yahoo.DividendYield
-		dyErr   error
-		prr     *yahoo.PayoutRatio
-		prErr   error
-		pd      *yahoo.PayoutDate
-		pdErr   error
-		rng     *yahoo.FiftyTwoWeekRange
-		rngErr  error
-		perf    *yahoo.PerformanceReturns
-		perfErr error
+		pe        *yahoo.PERatio
+		peErr     error
+		fcf       *yahoo.FreeCashFlow
+		fcfErr    error
+		cfq       *yahoo.CashFlowQuality
+		cfqErr    error
+		d2e       *yahoo.DebtToEquity
+		d2eErr    error
+		ev        *yahoo.EVToEBITDA
+		evErr     error
+		mc        *yahoo.MarketCap
+		mcErr     error
+		ps        *yahoo.PriceToSales
+		psErr     error
+		pb        *yahoo.PriceToBook
+		pbErr     error
+		fy        *yahoo.FreeCashFlowYield
+		fyErr     error
+		pm        *yahoo.ProfitMargin
+		pmErr     error
+		om        *yahoo.OperatingMargin
+		omErr     error
+		eg        *yahoo.QuarterlyEarningsGrowth
+		egErr     error
+		rg        *yahoo.QuarterlyRevenueGrowth
+		rgErr     error
+		cash      *yahoo.Cash
+		cashErr   error
+		debt      *yahoo.Debt
+		debtErr   error
+		dy        *yahoo.DividendYield
+		dyErr     error
+		prr       *yahoo.PayoutRatio
+		prErr     error
+		pd        *yahoo.PayoutDate
+		pdErr     error
+		rng       *yahoo.FiftyTwoWeekRange
+		rngErr    error
+		perf      *yahoo.PerformanceReturns
+		perfErr   error
+		sector    *yahoo.Sector
+		sectorErr error
 	)
 
 	var wg sync.WaitGroup
@@ -135,6 +137,7 @@ func main() {
 	run(func() { pd, pdErr = client.GetPayoutDate(ctx, ticker) })
 	run(func() { rng, rngErr = client.FetchFiftyTwoWeekRange(ctx, ticker) })
 	run(func() { perf, perfErr = client.FetchPerformance(ctx, ticker) })
+	run(func() { sector, sectorErr = client.GetSector(ctx, ticker) })
 
 	wg.Wait()
 
@@ -144,6 +147,12 @@ func main() {
 		rows = append(rows, row{"Price", "error: " + quoteErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Price", fmt.Sprintf("%.2f %s", quote.Price, quote.Currency), ""})
+	}
+
+	if sectorErr != nil {
+		rows = append(rows, row{"Sector", "error: " + sectorErr.Error(), ""})
+	} else {
+		rows = append(rows, row{"Sector", sector.Sector, ""})
 	}
 
 	health, healthReason := yahoo.ClassifyHealth(fcf, cfq, d2e)

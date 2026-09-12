@@ -74,6 +74,51 @@ func TestGetMarketCap(t *testing.T) {
 	}
 }
 
+func TestGetSector(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		want    string
+		wantErr error
+	}{
+		{
+			name: "happy path",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+					"assetProfile": map[string]interface{}{"sector": "Technology"},
+				}))
+			},
+			want: "Technology",
+		},
+		{
+			name:    "not found — empty result",
+			handler: func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(emptySummary()) },
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name:    "http error status",
+			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
+			wantErr: yahoo.ErrAPIError,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+			got, err := newTestClient(t, srv).GetSector(context.Background(), "AAPL")
+			if !checkErr(t, err, tc.wantErr) {
+				return
+			}
+			if got.Sector != tc.want {
+				t.Errorf("sector: got %q, want %q", got.Sector, tc.want)
+			}
+			if got.Symbol != "AAPL" {
+				t.Errorf("symbol: got %q, want %q", got.Symbol, "AAPL")
+			}
+		})
+	}
+}
+
 func TestGetPriceToSales(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{

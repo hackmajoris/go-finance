@@ -944,6 +944,34 @@ func (c *Client) GetPriceToSales(ctx context.Context, ticker string) (*PriceToSa
 	return &PriceToSales{Symbol: ticker, Ratio: r, Interpretation: describePriceToSales(r)}, nil
 }
 
+// Sector holds a company's business sector classification (e.g. "Technology").
+type Sector struct {
+	Symbol string `json:"symbol"` // Yahoo Finance ticker
+	Sector string `json:"sector"` // Yahoo's top-level sector classification
+}
+
+// GetSector returns the business sector classification for a stock ticker.
+func (c *Client) GetSector(ctx context.Context, ticker string) (*Sector, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+	var out struct {
+		AssetProfile struct {
+			Sector string `json:"sector"`
+		} `json:"assetProfile"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, ticker, "assetProfile", &out)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	return &Sector{Symbol: ticker, Sector: out.AssetProfile.Sector}, nil
+}
+
 // PriceToBook holds the price/book ratio for a symbol.
 type PriceToBook struct {
 	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
