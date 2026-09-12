@@ -106,6 +106,8 @@ func main() {
 		perfErr   error
 		sector    *yahoo.Sector
 		sectorErr error
+		bench     *yahoo.SectorBenchmark
+		benchErr  error
 	)
 
 	var wg sync.WaitGroup
@@ -138,6 +140,7 @@ func main() {
 	run(func() { rng, rngErr = client.FetchFiftyTwoWeekRange(ctx, ticker) })
 	run(func() { perf, perfErr = client.FetchPerformance(ctx, ticker) })
 	run(func() { sector, sectorErr = client.GetSector(ctx, ticker) })
+	run(func() { bench, benchErr = client.GetSectorBenchmark(ctx, ticker) })
 
 	wg.Wait()
 
@@ -165,6 +168,13 @@ func main() {
 	} else {
 		rows = append(rows, row{"P/E (trailing)", fmt.Sprintf("%.2f", pe.PE), pe.Interpretation})
 		rows = append(rows, row{"P/E (forward)", fmt.Sprintf("%.2f", pe.ForwardPE), ""})
+	}
+
+	if benchErr != nil {
+		rows = append(rows, row{"Sector P/E", "error: " + benchErr.Error(), ""})
+	} else {
+		rows = append(rows, row{"Sector P/E", fmt.Sprintf("%.2f", bench.SectorPE), fmt.Sprintf("%.1f%% vs sector", bench.PEVsSectorPercent)})
+		rows = append(rows, row{"Sector EV/EBITDA", fmt.Sprintf("%.2fx", bench.SectorEVToEBITDA), fmt.Sprintf("%.1f%% vs sector", bench.EVToEBITDAVsSectorPercent)})
 	}
 
 	if fcfErr != nil {

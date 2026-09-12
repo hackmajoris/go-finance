@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,6 +118,120 @@ func TestGetSector(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetSectorBenchmark(t *testing.T) {
+	peerValuation := map[string]map[string]interface{}{
+		"PEER1": {
+			"summaryDetail":        map[string]interface{}{"marketCap": raw(1000)},
+			"defaultKeyStatistics": map[string]interface{}{"enterpriseValue": raw(1200), "netIncomeToCommon": raw(100)},
+			"financialData":        map[string]interface{}{"ebitda": raw(150)},
+		},
+		"PEER2": {
+			"summaryDetail":        map[string]interface{}{"marketCap": raw(3000)},
+			"defaultKeyStatistics": map[string]interface{}{"enterpriseValue": raw(3600), "netIncomeToCommon": raw(300)},
+			"financialData":        map[string]interface{}{"ebitda": raw(450)},
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v7/finance/quote":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"quoteResponse": map[string]interface{}{
+					"result": []map[string]interface{}{{"symbol": "AAPL", "trailingPE": 20.0, "forwardPE": 22.0}},
+					"error":  nil,
+				},
+			})
+		case r.URL.Path == "/v1/finance/sectors/technology":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"topCompanies": []map[string]interface{}{{"symbol": "PEER1"}, {"symbol": "PEER2"}},
+				},
+			})
+		case r.URL.Path == "/v10/finance/quoteSummary/AAPL" && r.URL.Query().Get("modules") == "assetProfile":
+			_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+				"assetProfile": map[string]interface{}{"sector": "Technology"},
+			}))
+		case r.URL.Path == "/v10/finance/quoteSummary/AAPL" && r.URL.Query().Get("modules") == "defaultKeyStatistics":
+			_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+				"defaultKeyStatistics": map[string]interface{}{"enterpriseToEbitda": raw(25)},
+			}))
+		default:
+			symbol := strings.TrimPrefix(r.URL.Path, "/v10/finance/quoteSummary/")
+			modules, ok := peerValuation[symbol]
+			if !ok {
+				_ = json.NewEncoder(w).Encode(emptySummary())
+				return
+			}
+			_ = json.NewEncoder(w).Encode(summaryResult(modules))
+		}
+	}))
+	defer srv.Close()
+
+	got, err := newTestClient(t, srv).GetSectorBenchmark(context.Background(), "AAPL")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got.Sector != "Technology" {
+		t.Errorf("sector: got %q, want %q", got.Sector, "Technology")
+	}
+	if got.PeerCount != 2 {
+		t.Errorf("peerCount: got %d, want 2", got.PeerCount)
+	}
+	if got.PE != 20 {
+		t.Errorf("PE: got %f, want 20", got.PE)
+	}
+	if got.SectorPE != 10 {
+		t.Errorf("SectorPE: got %f, want 10", got.SectorPE)
+	}
+	if got.PEVsSectorPercent != 100 {
+		t.Errorf("PEVsSectorPercent: got %f, want 100", got.PEVsSectorPercent)
+	}
+	if got.EVToEBITDA != 25 {
+		t.Errorf("EVToEBITDA: got %f, want 25", got.EVToEBITDA)
+	}
+	if got.SectorEVToEBITDA != 8 {
+		t.Errorf("SectorEVToEBITDA: got %f, want 8", got.SectorEVToEBITDA)
+	}
+	if got.EVToEBITDAVsSectorPercent != 212.5 {
+		t.Errorf("EVToEBITDAVsSectorPercent: got %f, want 212.5", got.EVToEBITDAVsSectorPercent)
+	}
+}
+
+func TestGetSectorBenchmark_NoPeerData(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v7/finance/quote":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"quoteResponse": map[string]interface{}{
+					"result": []map[string]interface{}{{"symbol": "AAPL", "trailingPE": 20.0, "forwardPE": 22.0}},
+					"error":  nil,
+				},
+			})
+		case r.URL.Path == "/v1/finance/sectors/technology":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"topCompanies": []map[string]interface{}{{"symbol": "PEER1"}},
+				},
+			})
+		case r.URL.Path == "/v10/finance/quoteSummary/AAPL" && r.URL.Query().Get("modules") == "assetProfile":
+			_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+				"assetProfile": map[string]interface{}{"sector": "Technology"},
+			}))
+		case r.URL.Path == "/v10/finance/quoteSummary/AAPL" && r.URL.Query().Get("modules") == "defaultKeyStatistics":
+			_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+				"defaultKeyStatistics": map[string]interface{}{"enterpriseToEbitda": raw(25)},
+			}))
+		default:
+			_ = json.NewEncoder(w).Encode(emptySummary())
+		}
+	}))
+	defer srv.Close()
+
+	_, err := newTestClient(t, srv).GetSectorBenchmark(context.Background(), "AAPL")
+	checkErr(t, err, yahoo.ErrAPIError)
 }
 
 func TestGetPriceToSales(t *testing.T) {

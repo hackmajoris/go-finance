@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -970,6 +971,211 @@ func (c *Client) GetSector(ctx context.Context, ticker string) (*Sector, error) 
 		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
 	}
 	return &Sector{Symbol: ticker, Sector: out.AssetProfile.Sector}, nil
+}
+
+// sectorPeerCount is how many of a sector's top companies (by market weight) are
+// aggregated into the sector benchmark.
+const sectorPeerCount = 10
+
+// SectorBenchmark compares a stock's trailing P/E and EV/EBITDA against a
+// market-cap-weighted sector aggregate — ΣmarketCap/ΣnetIncome for P/E, and
+// ΣenterpriseValue/ΣEBITDA for EV/EBITDA — computed across the sector's top
+// peer companies by market weight. This is a weighted average, not a
+// statistical median: a handful of mega-caps dominate the sum, same as how
+// Yahoo itself weights sector performance.
+type SectorBenchmark struct {
+	Symbol    string `json:"symbol"`    // Yahoo Finance ticker
+	Sector    string `json:"sector"`    // Yahoo's top-level sector classification
+	PeerCount int    `json:"peerCount"` // peers whose data was actually available and used
+
+	PE                float64 `json:"pe"`                // this stock's trailing P/E
+	SectorPE          float64 `json:"sectorPE"`          // sector aggregate P/E
+	PEVsSectorPercent float64 `json:"peVsSectorPercent"` // (PE - SectorPE) / SectorPE * 100
+
+	EVToEBITDA                float64 `json:"evToEBITDA"`                // this stock's EV/EBITDA
+	SectorEVToEBITDA          float64 `json:"sectorEVToEBITDA"`          // sector aggregate EV/EBITDA
+	EVToEBITDAVsSectorPercent float64 `json:"evToEBITDAVsSectorPercent"` // (EVToEBITDA - SectorEVToEBITDA) / SectorEVToEBITDA * 100
+}
+
+// GetSectorBenchmark compares a stock ticker's trailing P/E and EV/EBITDA against
+// a market-cap-weighted aggregate of the top peer companies in its sector.
+func (c *Client) GetSectorBenchmark(ctx context.Context, ticker string) (*SectorBenchmark, error) {
+	if c.crumb == "" {
+		if err := c.fetchCrumb(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	sector, err := c.GetSector(ctx, ticker)
+	if err != nil {
+		return nil, err
+	}
+	pe, err := c.GetPE(ctx, ticker)
+	if err != nil {
+		return nil, err
+	}
+	ev, err := c.GetEVToEBITDA(ctx, ticker)
+	if err != nil {
+		return nil, err
+	}
+
+	peers, err := c.fetchSectorPeers(ctx, sectorSlug(sector.Sector), sectorPeerCount)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		mu                            sync.Mutex
+		sumMarketCap, sumNetIncome    float64
+		sumEnterpriseValue, sumEBITDA float64
+		peerCount                     int
+		wg                            sync.WaitGroup
+	)
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(symbol string) {
+			defer wg.Done()
+			in, found, err := c.fetchValuationAggregateInputs(ctx, symbol)
+			if err != nil || !found || !in.sane() {
+				return
+			}
+			mu.Lock()
+			sumMarketCap += in.marketCap
+			sumNetIncome += in.netIncome
+			sumEnterpriseValue += in.enterpriseValue
+			sumEBITDA += in.ebitda
+			peerCount++
+			mu.Unlock()
+		}(peer)
+	}
+	wg.Wait()
+
+	if peerCount == 0 {
+		return nil, fmt.Errorf("%w: no sector peer data available for sector %q", ErrAPIError, sector.Sector)
+	}
+
+	b := &SectorBenchmark{
+		Symbol:     ticker,
+		Sector:     sector.Sector,
+		PeerCount:  peerCount,
+		PE:         pe.PE,
+		EVToEBITDA: ev.Ratio,
+	}
+	if sumNetIncome != 0 {
+		b.SectorPE = sumMarketCap / sumNetIncome
+	}
+	if sumEBITDA != 0 {
+		b.SectorEVToEBITDA = sumEnterpriseValue / sumEBITDA
+	}
+	if b.SectorPE != 0 {
+		b.PEVsSectorPercent = (b.PE - b.SectorPE) / b.SectorPE * 100
+	}
+	if b.SectorEVToEBITDA != 0 {
+		b.EVToEBITDAVsSectorPercent = (b.EVToEBITDA - b.SectorEVToEBITDA) / b.SectorEVToEBITDA * 100
+	}
+	return b, nil
+}
+
+// sectorSlug converts a Yahoo sector name (e.g. "Financial Services") into the
+// slug used by Yahoo's sectors endpoint (e.g. "financial-services").
+func sectorSlug(sector string) string {
+	return strings.ToLower(strings.ReplaceAll(sector, " ", "-"))
+}
+
+// fetchSectorPeers returns up to n ticker symbols from a sector's top-companies
+// list (ordered by market weight), identified by its Yahoo sector slug.
+func (c *Client) fetchSectorPeers(ctx context.Context, slug string, n int) ([]string, error) {
+	u := fmt.Sprintf("%s/v1/finance/sectors/%s?crumb=%s", c.baseURL, slug, url.QueryEscape(c.crumb))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("executing request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)
+	}
+
+	var payload struct {
+		Data struct {
+			TopCompanies []struct {
+				Symbol string `json:"symbol"`
+			} `json:"topCompanies"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decoding response: %w", err)
+	}
+
+	symbols := make([]string, 0, n)
+	for i, tc := range payload.Data.TopCompanies {
+		if i >= n {
+			break
+		}
+		symbols = append(symbols, tc.Symbol)
+	}
+	if len(symbols) == 0 {
+		return nil, fmt.Errorf("%w: no companies found for sector %q", ErrAPIError, slug)
+	}
+	return symbols, nil
+}
+
+// valuationAggregateInputs holds the raw figures needed to fold one peer
+// company into a sector's market-cap-weighted P/E and EV/EBITDA aggregate.
+type valuationAggregateInputs struct {
+	marketCap       float64
+	netIncome       float64
+	enterpriseValue float64
+	ebitda          float64
+}
+
+// maxSaneValuationRatio bounds implied P/E and EV/EBITDA for a peer to be
+// folded into a sector aggregate. Yahoo's sector top-companies list
+// occasionally includes a ticker with corrupted fundamentals (e.g. a recently
+// merged or renamed symbol); one such outlier can otherwise dominate the sum.
+const maxSaneValuationRatio = 500
+
+// sane reports whether these inputs are plausible enough to include in a
+// sector aggregate: positive enterprise value and EBITDA, non-zero net
+// income, and implied ratios within a sane bound.
+func (in valuationAggregateInputs) sane() bool {
+	if in.netIncome == 0 || in.enterpriseValue <= 0 || in.ebitda <= 0 {
+		return false
+	}
+	impliedPE := in.marketCap / in.netIncome
+	impliedEVToEBITDA := in.enterpriseValue / in.ebitda
+	return math.Abs(impliedPE) <= maxSaneValuationRatio && math.Abs(impliedEVToEBITDA) <= maxSaneValuationRatio
+}
+
+func (c *Client) fetchValuationAggregateInputs(ctx context.Context, symbol string) (valuationAggregateInputs, bool, error) {
+	var out struct {
+		SummaryDetail struct {
+			MarketCap rawValue `json:"marketCap"`
+		} `json:"summaryDetail"`
+		DefaultKeyStatistics struct {
+			EnterpriseValue   rawValue `json:"enterpriseValue"`
+			NetIncomeToCommon rawValue `json:"netIncomeToCommon"`
+		} `json:"defaultKeyStatistics"`
+		FinancialData struct {
+			EBITDA rawValue `json:"ebitda"`
+		} `json:"financialData"`
+	}
+	found, err := c.fetchQuoteSummary(ctx, symbol, "summaryDetail,defaultKeyStatistics,financialData", &out)
+	if err != nil || !found {
+		return valuationAggregateInputs{}, found, err
+	}
+	return valuationAggregateInputs{
+		marketCap:       out.SummaryDetail.MarketCap.Raw,
+		netIncome:       out.DefaultKeyStatistics.NetIncomeToCommon.Raw,
+		enterpriseValue: out.DefaultKeyStatistics.EnterpriseValue.Raw,
+		ebitda:          out.FinancialData.EBITDA.Raw,
+	}, true, nil
 }
 
 // PriceToBook holds the price/book ratio for a symbol.
