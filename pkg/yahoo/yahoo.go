@@ -32,6 +32,7 @@ const (
 	defaultV8BaseURL = "https://query1.finance.yahoo.com"
 	crumbURL         = "https://query2.finance.yahoo.com/v1/test/getcrumb"
 	financeURL       = "https://finance.yahoo.com/"
+	userAgent        = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
 var reCRSF = regexp.MustCompile(`csrfToken" value="([^"]+)"`)
@@ -48,6 +49,7 @@ type Client struct {
 	baseURL    string
 	v8BaseURL  string
 	crumbURL   string
+	crumbMu    sync.Mutex
 	crumb      string
 }
 
@@ -72,7 +74,7 @@ type HistoricalBar struct {
 }
 
 // YearlyBar holds OHLC price data aggregated across a full calendar year.
-// Open comes from Q1, Close from Q4, High and Low are the extremes across all four quarters.
+// Open is the first monthly open, Close the last monthly close, High and Low the extremes across all months.
 // Avg is the simple average of Open, High, Low, and Close.
 type YearlyBar struct {
 	Symbol string  `json:"symbol"` // Yahoo Finance ticker
@@ -132,10 +134,23 @@ func (c *Client) get(ctx context.Context, rawURL string) (*http.Response, error)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
 	return c.httpClient.Do(req)
+}
+
+// ensureCrumb runs the crumb handshake once, even under concurrent callers.
+// A failed handshake leaves the crumb empty so the next call retries it.
+// Once set, the crumb is never written again, so callers may read c.crumb
+// without the lock after ensureCrumb returns.
+func (c *Client) ensureCrumb(ctx context.Context) error {
+	c.crumbMu.Lock()
+	defer c.crumbMu.Unlock()
+	if c.crumb != "" {
+		return nil
+	}
+	return c.fetchCrumb(ctx)
 }
 
 // fetchCrumb handles the Yahoo Finance consent flow and then retrieves the crumb.
@@ -187,7 +202,7 @@ func (c *Client) acceptConsent(ctx context.Context, consentPageURL, html string)
 		return fmt.Errorf("building consent POST: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Referer", consentPageURL)
 
 	postResp, err := c.httpClient.Do(req)
@@ -203,7 +218,7 @@ func (c *Client) doFetchCrumb(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("building crumb request: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -225,10 +240,8 @@ func (c *Client) doFetchCrumb(ctx context.Context) error {
 
 // GetQuote returns the current price for a ticker. Forex pairs like "USD-EUR" are resolved automatically.
 func (c *Client) GetQuote(ctx context.Context, ticker string) (*Quote, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
+	if err := c.ensureCrumb(ctx); err != nil {
+		return nil, err
 	}
 
 	quote, err := c.doGetQuote(ctx, ticker)
@@ -278,7 +291,7 @@ func (c *Client) fetchV7Quote(ctx context.Context, symbol string) (*v7QuoteResul
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -355,10 +368,8 @@ func describePE(pe, forwardPE float64) string {
 
 // GetPE returns the trailing and forward P/E ratios for a stock ticker.
 func (c *Client) GetPE(ctx context.Context, ticker string) (*PERatio, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
+	if err := c.ensureCrumb(ctx); err != nil {
+		return nil, err
 	}
 
 	r, err := c.fetchV7Quote(ctx, ticker)
@@ -389,10 +400,8 @@ type AnalystRating struct {
 
 // GetAnalystRating returns Yahoo's average analyst recommendation for a stock ticker.
 func (c *Client) GetAnalystRating(ctx context.Context, ticker string) (*AnalystRating, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
+	if err := c.ensureCrumb(ctx); err != nil {
+		return nil, err
 	}
 
 	r, err := c.fetchV7Quote(ctx, ticker)
@@ -440,80 +449,11 @@ func describeFCF(fcf float64) string {
 
 // GetFreeCashFlow returns the trailing twelve-month free cash flow for a stock ticker.
 func (c *Client) GetFreeCashFlow(ctx context.Context, ticker string) (*FreeCashFlow, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-
-	fcf, err := c.fetchFreeCashFlow(ctx, ticker)
+	m, err := c.fetchModules(ctx, ticker, "financialData")
 	if err != nil {
 		return nil, err
 	}
-	if fcf == nil {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-
-	return &FreeCashFlow{Symbol: ticker, FCF: *fcf, Interpretation: describeFCF(*fcf)}, nil
-}
-
-// fetchFreeCashFlow fetches the financialData.freeCashflow value for a symbol (requires crumb).
-func (c *Client) fetchFreeCashFlow(ctx context.Context, symbol string) (*float64, error) {
-	u, err := url.Parse(fmt.Sprintf("%s/v10/finance/quoteSummary/%s", c.baseURL, symbol))
-	if err != nil {
-		return nil, fmt.Errorf("parsing url: %w", err)
-	}
-	q := u.Query()
-	q.Set("modules", "financialData")
-	q.Set("crumb", c.crumb)
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("building request: %w", err)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("executing request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)
-	}
-
-	var payload struct {
-		QuoteSummary struct {
-			Result []struct {
-				FinancialData struct {
-					FreeCashflow struct {
-						Raw float64 `json:"raw"`
-					} `json:"freeCashflow"`
-				} `json:"financialData"`
-			} `json:"result"`
-			Error interface{} `json:"error"`
-		} `json:"quoteSummary"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
-	}
-
-	if payload.QuoteSummary.Error != nil {
-		return nil, fmt.Errorf("%w: %v", ErrAPIError, payload.QuoteSummary.Error)
-	}
-
-	if len(payload.QuoteSummary.Result) == 0 {
-		return nil, nil
-	}
-
-	fcf := payload.QuoteSummary.Result[0].FinancialData.FreeCashflow.Raw
-	return &fcf, nil
+	return m.freeCashFlow(ticker), nil
 }
 
 // CashFlowQuality holds operating cash flow against net income for a symbol.
@@ -550,94 +490,11 @@ func describeCashFlowQuality(ratio, netIncome float64) string {
 // GetOperatingCashFlowVsNetIncome returns trailing twelve-month operating cash flow
 // against net income for a stock ticker.
 func (c *Client) GetOperatingCashFlowVsNetIncome(ctx context.Context, ticker string) (*CashFlowQuality, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-
-	q, err := c.fetchCashFlowQuality(ctx, ticker)
+	m, err := c.fetchModules(ctx, ticker, "financialData,defaultKeyStatistics")
 	if err != nil {
 		return nil, err
 	}
-	if q == nil {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-
-	q.Symbol = ticker
-	if q.NetIncome != 0 {
-		q.Ratio = q.OperatingCashFlow / q.NetIncome
-	}
-	q.Interpretation = describeCashFlowQuality(q.Ratio, q.NetIncome)
-	return q, nil
-}
-
-// fetchCashFlowQuality fetches operatingCashflow (financialData) and netIncomeToCommon
-// (defaultKeyStatistics) for a symbol in a single quoteSummary call (requires crumb).
-func (c *Client) fetchCashFlowQuality(ctx context.Context, symbol string) (*CashFlowQuality, error) {
-	u, err := url.Parse(fmt.Sprintf("%s/v10/finance/quoteSummary/%s", c.baseURL, symbol))
-	if err != nil {
-		return nil, fmt.Errorf("parsing url: %w", err)
-	}
-	q := u.Query()
-	q.Set("modules", "financialData,defaultKeyStatistics")
-	q.Set("crumb", c.crumb)
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("building request: %w", err)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("executing request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)
-	}
-
-	var payload struct {
-		QuoteSummary struct {
-			Result []struct {
-				FinancialData struct {
-					OperatingCashflow struct {
-						Raw float64 `json:"raw"`
-					} `json:"operatingCashflow"`
-				} `json:"financialData"`
-				DefaultKeyStatistics struct {
-					NetIncomeToCommon struct {
-						Raw float64 `json:"raw"`
-					} `json:"netIncomeToCommon"`
-				} `json:"defaultKeyStatistics"`
-			} `json:"result"`
-			Error interface{} `json:"error"`
-		} `json:"quoteSummary"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
-	}
-
-	if payload.QuoteSummary.Error != nil {
-		return nil, fmt.Errorf("%w: %v", ErrAPIError, payload.QuoteSummary.Error)
-	}
-
-	if len(payload.QuoteSummary.Result) == 0 {
-		return nil, nil
-	}
-
-	r := payload.QuoteSummary.Result[0]
-	return &CashFlowQuality{
-		OperatingCashFlow: r.FinancialData.OperatingCashflow.Raw,
-		NetIncome:         r.DefaultKeyStatistics.NetIncomeToCommon.Raw,
-	}, nil
+	return m.cashFlowQuality(ticker), nil
 }
 
 // DebtToEquity holds the debt-to-equity ratio for a symbol.
@@ -662,80 +519,11 @@ func describeDebtToEquity(ratio float64) string {
 
 // GetDebtToEquity returns the debt-to-equity ratio for a stock ticker.
 func (c *Client) GetDebtToEquity(ctx context.Context, ticker string) (*DebtToEquity, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-
-	ratio, err := c.fetchDebtToEquity(ctx, ticker)
+	m, err := c.fetchModules(ctx, ticker, "financialData")
 	if err != nil {
 		return nil, err
 	}
-	if ratio == nil {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-
-	return &DebtToEquity{Symbol: ticker, Ratio: *ratio, Interpretation: describeDebtToEquity(*ratio)}, nil
-}
-
-// fetchDebtToEquity fetches the financialData.debtToEquity value for a symbol (requires crumb).
-func (c *Client) fetchDebtToEquity(ctx context.Context, symbol string) (*float64, error) {
-	u, err := url.Parse(fmt.Sprintf("%s/v10/finance/quoteSummary/%s", c.baseURL, symbol))
-	if err != nil {
-		return nil, fmt.Errorf("parsing url: %w", err)
-	}
-	q := u.Query()
-	q.Set("modules", "financialData")
-	q.Set("crumb", c.crumb)
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("building request: %w", err)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("executing request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)
-	}
-
-	var payload struct {
-		QuoteSummary struct {
-			Result []struct {
-				FinancialData struct {
-					DebtToEquity struct {
-						Raw float64 `json:"raw"`
-					} `json:"debtToEquity"`
-				} `json:"financialData"`
-			} `json:"result"`
-			Error interface{} `json:"error"`
-		} `json:"quoteSummary"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
-	}
-
-	if payload.QuoteSummary.Error != nil {
-		return nil, fmt.Errorf("%w: %v", ErrAPIError, payload.QuoteSummary.Error)
-	}
-
-	if len(payload.QuoteSummary.Result) == 0 {
-		return nil, nil
-	}
-
-	ratio := payload.QuoteSummary.Result[0].FinancialData.DebtToEquity.Raw
-	return &ratio, nil
+	return m.debtToEquity(ticker), nil
 }
 
 // EVToEBITDA holds the enterprise-value-to-EBITDA ratio for a symbol.
@@ -765,80 +553,11 @@ func describeEVToEBITDA(ratio float64) string {
 
 // GetEVToEBITDA returns the enterprise-value-to-EBITDA ratio for a stock ticker.
 func (c *Client) GetEVToEBITDA(ctx context.Context, ticker string) (*EVToEBITDA, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-
-	ratio, err := c.fetchEVToEBITDA(ctx, ticker)
+	m, err := c.fetchModules(ctx, ticker, "defaultKeyStatistics")
 	if err != nil {
 		return nil, err
 	}
-	if ratio == nil {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-
-	return &EVToEBITDA{Symbol: ticker, Ratio: *ratio, Interpretation: describeEVToEBITDA(*ratio)}, nil
-}
-
-// fetchEVToEBITDA fetches the defaultKeyStatistics.enterpriseToEbitda value for a symbol (requires crumb).
-func (c *Client) fetchEVToEBITDA(ctx context.Context, symbol string) (*float64, error) {
-	u, err := url.Parse(fmt.Sprintf("%s/v10/finance/quoteSummary/%s", c.baseURL, symbol))
-	if err != nil {
-		return nil, fmt.Errorf("parsing url: %w", err)
-	}
-	q := u.Query()
-	q.Set("modules", "defaultKeyStatistics")
-	q.Set("crumb", c.crumb)
-	u.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("building request: %w", err)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("executing request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: status %d", ErrAPIError, resp.StatusCode)
-	}
-
-	var payload struct {
-		QuoteSummary struct {
-			Result []struct {
-				DefaultKeyStatistics struct {
-					EnterpriseToEbitda struct {
-						Raw float64 `json:"raw"`
-					} `json:"enterpriseToEbitda"`
-				} `json:"defaultKeyStatistics"`
-			} `json:"result"`
-			Error interface{} `json:"error"`
-		} `json:"quoteSummary"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
-	}
-
-	if payload.QuoteSummary.Error != nil {
-		return nil, fmt.Errorf("%w: %v", ErrAPIError, payload.QuoteSummary.Error)
-	}
-
-	if len(payload.QuoteSummary.Result) == 0 {
-		return nil, nil
-	}
-
-	ratio := payload.QuoteSummary.Result[0].DefaultKeyStatistics.EnterpriseToEbitda.Raw
-	return &ratio, nil
+	return m.evToEBITDA(ticker), nil
 }
 
 // rawValue matches Yahoo's {"raw": <number>, "fmt": ...} field wrapper; only Raw is read.
@@ -864,7 +583,7 @@ func (c *Client) fetchQuoteSummary(ctx context.Context, symbol, modules string, 
 	if err != nil {
 		return false, fmt.Errorf("building request: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -900,6 +619,218 @@ func (c *Client) fetchQuoteSummary(ctx context.Context, symbol, modules string, 
 	return true, nil
 }
 
+// fundamentalsModules is every quoteSummary module GetFundamentals reads in one request.
+const fundamentalsModules = "financialData,defaultKeyStatistics,summaryDetail,calendarEvents,assetProfile"
+
+// quoteSummaryModules is the union of quoteSummary fields read by the single-indicator
+// methods and GetFundamentals. Each method requests only the modules it needs; fields of
+// modules not requested decode to zero. Both paths share the builder methods below, so a
+// batched and a single-indicator read of the same data always agree.
+type quoteSummaryModules struct {
+	FinancialData struct {
+		FreeCashflow      rawValue `json:"freeCashflow"`
+		OperatingCashflow rawValue `json:"operatingCashflow"`
+		DebtToEquity      rawValue `json:"debtToEquity"`
+		ProfitMargins     rawValue `json:"profitMargins"`
+		OperatingMargins  rawValue `json:"operatingMargins"`
+		RevenueGrowth     rawValue `json:"revenueGrowth"`
+		TotalCash         rawValue `json:"totalCash"`
+		TotalDebt         rawValue `json:"totalDebt"`
+	} `json:"financialData"`
+	DefaultKeyStatistics struct {
+		NetIncomeToCommon       rawValue `json:"netIncomeToCommon"`
+		EnterpriseToEbitda      rawValue `json:"enterpriseToEbitda"`
+		PriceToBook             rawValue `json:"priceToBook"`
+		EarningsQuarterlyGrowth rawValue `json:"earningsQuarterlyGrowth"`
+	} `json:"defaultKeyStatistics"`
+	SummaryDetail struct {
+		MarketCap     rawValue `json:"marketCap"`
+		PriceToSales  rawValue `json:"priceToSalesTrailing12Months"`
+		DividendYield rawValue `json:"dividendYield"`
+		PayoutRatio   rawValue `json:"payoutRatio"`
+	} `json:"summaryDetail"`
+	CalendarEvents struct {
+		DividendDate rawValue `json:"dividendDate"`
+	} `json:"calendarEvents"`
+	AssetProfile struct {
+		Sector string `json:"sector"`
+	} `json:"assetProfile"`
+}
+
+// fetchModules ensures a crumb, fetches the given quoteSummary modules for ticker, and maps
+// a missing symbol to ErrTickerNotFound.
+func (c *Client) fetchModules(ctx context.Context, ticker, modules string) (*quoteSummaryModules, error) {
+	if err := c.ensureCrumb(ctx); err != nil {
+		return nil, err
+	}
+	var m quoteSummaryModules
+	found, err := c.fetchQuoteSummary(ctx, ticker, modules, &m)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
+	}
+	return &m, nil
+}
+
+func (m *quoteSummaryModules) freeCashFlow(ticker string) *FreeCashFlow {
+	v := m.FinancialData.FreeCashflow.Raw
+	return &FreeCashFlow{Symbol: ticker, FCF: v, Interpretation: describeFCF(v)}
+}
+
+func (m *quoteSummaryModules) cashFlowQuality(ticker string) *CashFlowQuality {
+	q := &CashFlowQuality{
+		Symbol:            ticker,
+		OperatingCashFlow: m.FinancialData.OperatingCashflow.Raw,
+		NetIncome:         m.DefaultKeyStatistics.NetIncomeToCommon.Raw,
+	}
+	if q.NetIncome != 0 {
+		q.Ratio = q.OperatingCashFlow / q.NetIncome
+	}
+	q.Interpretation = describeCashFlowQuality(q.Ratio, q.NetIncome)
+	return q
+}
+
+func (m *quoteSummaryModules) debtToEquity(ticker string) *DebtToEquity {
+	v := m.FinancialData.DebtToEquity.Raw
+	return &DebtToEquity{Symbol: ticker, Ratio: v, Interpretation: describeDebtToEquity(v)}
+}
+
+func (m *quoteSummaryModules) evToEBITDA(ticker string) *EVToEBITDA {
+	v := m.DefaultKeyStatistics.EnterpriseToEbitda.Raw
+	return &EVToEBITDA{Symbol: ticker, Ratio: v, Interpretation: describeEVToEBITDA(v)}
+}
+
+func (m *quoteSummaryModules) marketCap(ticker string) *MarketCap {
+	v := m.SummaryDetail.MarketCap.Raw
+	return &MarketCap{Symbol: ticker, MarketCap: v, Interpretation: describeMarketCap(v)}
+}
+
+func (m *quoteSummaryModules) priceToSales(ticker string) *PriceToSales {
+	v := m.SummaryDetail.PriceToSales.Raw
+	return &PriceToSales{Symbol: ticker, Ratio: v, Interpretation: describePriceToSales(v)}
+}
+
+func (m *quoteSummaryModules) sector(ticker string) *Sector {
+	return &Sector{Symbol: ticker, Sector: m.AssetProfile.Sector}
+}
+
+func (m *quoteSummaryModules) priceToBook(ticker string) *PriceToBook {
+	v := m.DefaultKeyStatistics.PriceToBook.Raw
+	return &PriceToBook{Symbol: ticker, Ratio: v, Interpretation: describePriceToBook(v)}
+}
+
+func (m *quoteSummaryModules) freeCashFlowYield(ticker string) *FreeCashFlowYield {
+	fcf := m.FinancialData.FreeCashflow.Raw
+	mc := m.SummaryDetail.MarketCap.Raw
+	yield := 0.0
+	if mc != 0 {
+		yield = fcf / mc * 100
+	}
+	return &FreeCashFlowYield{Symbol: ticker, FCF: fcf, MarketCap: mc, Yield: yield, Interpretation: describeFreeCashFlowYield(yield, mc)}
+}
+
+func (m *quoteSummaryModules) profitMargin(ticker string) *ProfitMargin {
+	pct := m.FinancialData.ProfitMargins.Raw * 100
+	return &ProfitMargin{Symbol: ticker, Margin: pct, Interpretation: describeProfitMargin(pct)}
+}
+
+func (m *quoteSummaryModules) operatingMargin(ticker string) *OperatingMargin {
+	pct := m.FinancialData.OperatingMargins.Raw * 100
+	return &OperatingMargin{Symbol: ticker, Margin: pct, Interpretation: describeOperatingMargin(pct)}
+}
+
+func (m *quoteSummaryModules) quarterlyEarningsGrowth(ticker string) *QuarterlyEarningsGrowth {
+	pct := m.DefaultKeyStatistics.EarningsQuarterlyGrowth.Raw * 100
+	return &QuarterlyEarningsGrowth{Symbol: ticker, Growth: pct, Interpretation: describeYoYGrowth(pct, "Quarterly earnings")}
+}
+
+func (m *quoteSummaryModules) quarterlyRevenueGrowth(ticker string) *QuarterlyRevenueGrowth {
+	pct := m.FinancialData.RevenueGrowth.Raw * 100
+	return &QuarterlyRevenueGrowth{Symbol: ticker, Growth: pct, Interpretation: describeYoYGrowth(pct, "Quarterly revenue")}
+}
+
+func (m *quoteSummaryModules) cash(ticker string) *Cash {
+	return &Cash{Symbol: ticker, Cash: m.FinancialData.TotalCash.Raw, Interpretation: "Total cash and short-term investments on the balance sheet. Pair with Debt for the net position."}
+}
+
+func (m *quoteSummaryModules) debt(ticker string) *Debt {
+	return &Debt{Symbol: ticker, Debt: m.FinancialData.TotalDebt.Raw, Interpretation: "Total short- and long-term borrowings on the balance sheet. Pair with Cash for the net position and read against cash flow strength."}
+}
+
+func (m *quoteSummaryModules) dividendYield(ticker string) *DividendYield {
+	pct := m.SummaryDetail.DividendYield.Raw * 100
+	return &DividendYield{Symbol: ticker, Yield: pct, Interpretation: describeDividendYield(pct)}
+}
+
+func (m *quoteSummaryModules) payoutRatio(ticker string) *PayoutRatio {
+	pct := m.SummaryDetail.PayoutRatio.Raw * 100
+	return &PayoutRatio{Symbol: ticker, Ratio: pct, Interpretation: describePayoutRatio(pct)}
+}
+
+func (m *quoteSummaryModules) payoutDate(ticker string) *PayoutDate {
+	var d time.Time
+	if raw := m.CalendarEvents.DividendDate.Raw; raw > 0 {
+		d = time.Unix(int64(raw), 0).UTC()
+	}
+	return &PayoutDate{Symbol: ticker, Date: d, Interpretation: describePayoutDate(d)}
+}
+
+// Fundamentals bundles every quoteSummary-based indicator for one symbol, fetched in a
+// single request. Each field equals what the matching single-indicator method returns.
+type Fundamentals struct {
+	Symbol                  string                   `json:"symbol"`
+	Sector                  *Sector                  `json:"sector"`
+	FreeCashFlow            *FreeCashFlow            `json:"freeCashFlow"`
+	CashFlowQuality         *CashFlowQuality         `json:"cashFlowQuality"`
+	DebtToEquity            *DebtToEquity            `json:"debtToEquity"`
+	EVToEBITDA              *EVToEBITDA              `json:"evToEBITDA"`
+	MarketCap               *MarketCap               `json:"marketCap"`
+	PriceToSales            *PriceToSales            `json:"priceToSales"`
+	PriceToBook             *PriceToBook             `json:"priceToBook"`
+	FreeCashFlowYield       *FreeCashFlowYield       `json:"freeCashFlowYield"`
+	ProfitMargin            *ProfitMargin            `json:"profitMargin"`
+	OperatingMargin         *OperatingMargin         `json:"operatingMargin"`
+	QuarterlyEarningsGrowth *QuarterlyEarningsGrowth `json:"quarterlyEarningsGrowth"`
+	QuarterlyRevenueGrowth  *QuarterlyRevenueGrowth  `json:"quarterlyRevenueGrowth"`
+	Cash                    *Cash                    `json:"cash"`
+	Debt                    *Debt                    `json:"debt"`
+	DividendYield           *DividendYield           `json:"dividendYield"`
+	PayoutRatio             *PayoutRatio             `json:"payoutRatio"`
+	PayoutDate              *PayoutDate              `json:"payoutDate"`
+}
+
+// GetFundamentals returns every quoteSummary-based indicator for a stock ticker in one
+// request, instead of one request per indicator method.
+func (c *Client) GetFundamentals(ctx context.Context, ticker string) (*Fundamentals, error) {
+	m, err := c.fetchModules(ctx, ticker, fundamentalsModules)
+	if err != nil {
+		return nil, err
+	}
+	return &Fundamentals{
+		Symbol:                  ticker,
+		Sector:                  m.sector(ticker),
+		FreeCashFlow:            m.freeCashFlow(ticker),
+		CashFlowQuality:         m.cashFlowQuality(ticker),
+		DebtToEquity:            m.debtToEquity(ticker),
+		EVToEBITDA:              m.evToEBITDA(ticker),
+		MarketCap:               m.marketCap(ticker),
+		PriceToSales:            m.priceToSales(ticker),
+		PriceToBook:             m.priceToBook(ticker),
+		FreeCashFlowYield:       m.freeCashFlowYield(ticker),
+		ProfitMargin:            m.profitMargin(ticker),
+		OperatingMargin:         m.operatingMargin(ticker),
+		QuarterlyEarningsGrowth: m.quarterlyEarningsGrowth(ticker),
+		QuarterlyRevenueGrowth:  m.quarterlyRevenueGrowth(ticker),
+		Cash:                    m.cash(ticker),
+		Debt:                    m.debt(ticker),
+		DividendYield:           m.dividendYield(ticker),
+		PayoutRatio:             m.payoutRatio(ticker),
+		PayoutDate:              m.payoutDate(ticker),
+	}, nil
+}
+
 // MarketCap holds the total market value of a company's outstanding shares.
 type MarketCap struct {
 	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
@@ -924,25 +855,11 @@ func describeMarketCap(v float64) string {
 
 // GetMarketCap returns the market capitalization for a stock ticker.
 func (c *Client) GetMarketCap(ctx context.Context, ticker string) (*MarketCap, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		SummaryDetail struct {
-			MarketCap rawValue `json:"marketCap"`
-		} `json:"summaryDetail"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "summaryDetail", &out)
+	m, err := c.fetchModules(ctx, ticker, "summaryDetail")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	v := out.SummaryDetail.MarketCap.Raw
-	return &MarketCap{Symbol: ticker, MarketCap: v, Interpretation: describeMarketCap(v)}, nil
+	return m.marketCap(ticker), nil
 }
 
 // PriceToSales holds the trailing price/sales ratio for a symbol.
@@ -967,25 +884,11 @@ func describePriceToSales(r float64) string {
 
 // GetPriceToSales returns the trailing price/sales ratio for a stock ticker.
 func (c *Client) GetPriceToSales(ctx context.Context, ticker string) (*PriceToSales, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		SummaryDetail struct {
-			PriceToSales rawValue `json:"priceToSalesTrailing12Months"`
-		} `json:"summaryDetail"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "summaryDetail", &out)
+	m, err := c.fetchModules(ctx, ticker, "summaryDetail")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	r := out.SummaryDetail.PriceToSales.Raw
-	return &PriceToSales{Symbol: ticker, Ratio: r, Interpretation: describePriceToSales(r)}, nil
+	return m.priceToSales(ticker), nil
 }
 
 // Sector holds a company's business sector classification (e.g. "Technology").
@@ -996,24 +899,11 @@ type Sector struct {
 
 // GetSector returns the business sector classification for a stock ticker.
 func (c *Client) GetSector(ctx context.Context, ticker string) (*Sector, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		AssetProfile struct {
-			Sector string `json:"sector"`
-		} `json:"assetProfile"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "assetProfile", &out)
+	m, err := c.fetchModules(ctx, ticker, "assetProfile")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	return &Sector{Symbol: ticker, Sector: out.AssetProfile.Sector}, nil
+	return m.sector(ticker), nil
 }
 
 // sectorPeerCount is how many of a sector's top companies (by market weight) are
@@ -1043,28 +933,35 @@ type SectorBenchmark struct {
 // GetSectorBenchmark compares a stock ticker's trailing P/E and EV/EBITDA against
 // a market-cap-weighted aggregate of the top peer companies in its sector.
 func (c *Client) GetSectorBenchmark(ctx context.Context, ticker string) (*SectorBenchmark, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-
-	sector, err := c.GetSector(ctx, ticker)
-	if err != nil {
-		return nil, err
-	}
-	pe, err := c.GetPE(ctx, ticker)
-	if err != nil {
-		return nil, err
-	}
-	ev, err := c.GetEVToEBITDA(ctx, ticker)
-	if err != nil {
+	if err := c.ensureCrumb(ctx); err != nil {
 		return nil, err
 	}
 
-	peers, err := c.fetchSectorPeers(ctx, sectorSlug(sector.Sector), sectorPeerCount)
-	if err != nil {
-		return nil, err
+	// PE and EV/EBITDA don't depend on the sector, so fetch them alongside the
+	// sector → peers → peer-data chain instead of before it.
+	var (
+		pe           *PERatio
+		ev           *EVToEBITDA
+		peErr, evErr error
+		ratios       sync.WaitGroup
+	)
+	ratios.Add(2)
+	go func() {
+		defer ratios.Done()
+		pe, peErr = c.GetPE(ctx, ticker)
+	}()
+	go func() {
+		defer ratios.Done()
+		ev, evErr = c.GetEVToEBITDA(ctx, ticker)
+	}()
+
+	sector, sectorErr := c.GetSector(ctx, ticker)
+	var (
+		peers    []string
+		peersErr error
+	)
+	if sectorErr == nil {
+		peers, peersErr = c.fetchSectorPeers(ctx, sectorSlug(sector.Sector), sectorPeerCount)
 	}
 
 	var (
@@ -1092,7 +989,13 @@ func (c *Client) GetSectorBenchmark(ctx context.Context, ticker string) (*Sector
 		}(peer)
 	}
 	wg.Wait()
+	ratios.Wait()
 
+	for _, err := range []error{sectorErr, peErr, evErr, peersErr} {
+		if err != nil {
+			return nil, err
+		}
+	}
 	if peerCount == 0 {
 		return nil, fmt.Errorf("%w: no sector peer data available for sector %q", ErrAPIError, sector.Sector)
 	}
@@ -1133,7 +1036,7 @@ func (c *Client) fetchSectorPeers(ctx context.Context, slug string, n int) ([]st
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -1243,25 +1146,11 @@ func describePriceToBook(r float64) string {
 
 // GetPriceToBook returns the price/book ratio for a stock ticker.
 func (c *Client) GetPriceToBook(ctx context.Context, ticker string) (*PriceToBook, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		DefaultKeyStatistics struct {
-			PriceToBook rawValue `json:"priceToBook"`
-		} `json:"defaultKeyStatistics"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "defaultKeyStatistics", &out)
+	m, err := c.fetchModules(ctx, ticker, "defaultKeyStatistics")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	r := out.DefaultKeyStatistics.PriceToBook.Raw
-	return &PriceToBook{Symbol: ticker, Ratio: r, Interpretation: describePriceToBook(r)}, nil
+	return m.priceToBook(ticker), nil
 }
 
 // FreeCashFlowYield holds trailing free cash flow expressed as a yield on market cap.
@@ -1291,33 +1180,11 @@ func describeFreeCashFlowYield(yield, marketCap float64) string {
 
 // GetFreeCashFlowYield returns trailing free cash flow as a yield on market cap for a stock ticker.
 func (c *Client) GetFreeCashFlowYield(ctx context.Context, ticker string) (*FreeCashFlowYield, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		FinancialData struct {
-			FreeCashflow rawValue `json:"freeCashflow"`
-		} `json:"financialData"`
-		SummaryDetail struct {
-			MarketCap rawValue `json:"marketCap"`
-		} `json:"summaryDetail"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData,summaryDetail", &out)
+	m, err := c.fetchModules(ctx, ticker, "financialData,summaryDetail")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	fcf := out.FinancialData.FreeCashflow.Raw
-	mc := out.SummaryDetail.MarketCap.Raw
-	yield := 0.0
-	if mc != 0 {
-		yield = fcf / mc * 100
-	}
-	return &FreeCashFlowYield{Symbol: ticker, FCF: fcf, MarketCap: mc, Yield: yield, Interpretation: describeFreeCashFlowYield(yield, mc)}, nil
+	return m.freeCashFlowYield(ticker), nil
 }
 
 // ProfitMargin holds the net profit margin (percentage) for a symbol.
@@ -1342,25 +1209,11 @@ func describeProfitMargin(pct float64) string {
 
 // GetProfitMargin returns the net profit margin for a stock ticker.
 func (c *Client) GetProfitMargin(ctx context.Context, ticker string) (*ProfitMargin, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		FinancialData struct {
-			ProfitMargins rawValue `json:"profitMargins"`
-		} `json:"financialData"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData", &out)
+	m, err := c.fetchModules(ctx, ticker, "financialData")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	pct := out.FinancialData.ProfitMargins.Raw * 100
-	return &ProfitMargin{Symbol: ticker, Margin: pct, Interpretation: describeProfitMargin(pct)}, nil
+	return m.profitMargin(ticker), nil
 }
 
 // OperatingMargin holds the operating margin (percentage) for a symbol.
@@ -1385,25 +1238,11 @@ func describeOperatingMargin(pct float64) string {
 
 // GetOperatingMargin returns the operating margin for a stock ticker.
 func (c *Client) GetOperatingMargin(ctx context.Context, ticker string) (*OperatingMargin, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		FinancialData struct {
-			OperatingMargins rawValue `json:"operatingMargins"`
-		} `json:"financialData"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData", &out)
+	m, err := c.fetchModules(ctx, ticker, "financialData")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	pct := out.FinancialData.OperatingMargins.Raw * 100
-	return &OperatingMargin{Symbol: ticker, Margin: pct, Interpretation: describeOperatingMargin(pct)}, nil
+	return m.operatingMargin(ticker), nil
 }
 
 // describeYoYGrowth renders a plain-language year-over-year growth reading for label.
@@ -1427,25 +1266,11 @@ type QuarterlyEarningsGrowth struct {
 
 // GetQuarterlyEarningsGrowth returns the latest quarter's year-over-year earnings growth for a stock ticker.
 func (c *Client) GetQuarterlyEarningsGrowth(ctx context.Context, ticker string) (*QuarterlyEarningsGrowth, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		DefaultKeyStatistics struct {
-			EarningsQuarterlyGrowth rawValue `json:"earningsQuarterlyGrowth"`
-		} `json:"defaultKeyStatistics"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "defaultKeyStatistics", &out)
+	m, err := c.fetchModules(ctx, ticker, "defaultKeyStatistics")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	pct := out.DefaultKeyStatistics.EarningsQuarterlyGrowth.Raw * 100
-	return &QuarterlyEarningsGrowth{Symbol: ticker, Growth: pct, Interpretation: describeYoYGrowth(pct, "Quarterly earnings")}, nil
+	return m.quarterlyEarningsGrowth(ticker), nil
 }
 
 // QuarterlyRevenueGrowth holds the most recent quarter's year-over-year revenue growth (percentage).
@@ -1457,25 +1282,11 @@ type QuarterlyRevenueGrowth struct {
 
 // GetQuarterlyRevenueGrowth returns the latest quarter's year-over-year revenue growth for a stock ticker.
 func (c *Client) GetQuarterlyRevenueGrowth(ctx context.Context, ticker string) (*QuarterlyRevenueGrowth, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		FinancialData struct {
-			RevenueGrowth rawValue `json:"revenueGrowth"`
-		} `json:"financialData"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData", &out)
+	m, err := c.fetchModules(ctx, ticker, "financialData")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	pct := out.FinancialData.RevenueGrowth.Raw * 100
-	return &QuarterlyRevenueGrowth{Symbol: ticker, Growth: pct, Interpretation: describeYoYGrowth(pct, "Quarterly revenue")}, nil
+	return m.quarterlyRevenueGrowth(ticker), nil
 }
 
 // Cash holds total cash and short-term investments on the balance sheet.
@@ -1487,25 +1298,11 @@ type Cash struct {
 
 // GetCash returns total cash and equivalents for a stock ticker.
 func (c *Client) GetCash(ctx context.Context, ticker string) (*Cash, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		FinancialData struct {
-			TotalCash rawValue `json:"totalCash"`
-		} `json:"financialData"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData", &out)
+	m, err := c.fetchModules(ctx, ticker, "financialData")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	v := out.FinancialData.TotalCash.Raw
-	return &Cash{Symbol: ticker, Cash: v, Interpretation: "Total cash and short-term investments on the balance sheet. Pair with Debt for the net position."}, nil
+	return m.cash(ticker), nil
 }
 
 // Debt holds total debt (short- and long-term borrowings) on the balance sheet.
@@ -1517,25 +1314,11 @@ type Debt struct {
 
 // GetDebt returns total debt for a stock ticker.
 func (c *Client) GetDebt(ctx context.Context, ticker string) (*Debt, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		FinancialData struct {
-			TotalDebt rawValue `json:"totalDebt"`
-		} `json:"financialData"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "financialData", &out)
+	m, err := c.fetchModules(ctx, ticker, "financialData")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	v := out.FinancialData.TotalDebt.Raw
-	return &Debt{Symbol: ticker, Debt: v, Interpretation: "Total short- and long-term borrowings on the balance sheet. Pair with Cash for the net position and read against cash flow strength."}, nil
+	return m.debt(ticker), nil
 }
 
 // DividendYield holds the forward dividend yield (percentage) for a symbol.
@@ -1561,25 +1344,11 @@ func describeDividendYield(pct float64) string {
 
 // GetDividendYield returns the dividend yield for a stock ticker. A zero yield (no dividend) is valid, not an error.
 func (c *Client) GetDividendYield(ctx context.Context, ticker string) (*DividendYield, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		SummaryDetail struct {
-			DividendYield rawValue `json:"dividendYield"`
-		} `json:"summaryDetail"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "summaryDetail", &out)
+	m, err := c.fetchModules(ctx, ticker, "summaryDetail")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	pct := out.SummaryDetail.DividendYield.Raw * 100
-	return &DividendYield{Symbol: ticker, Yield: pct, Interpretation: describeDividendYield(pct)}, nil
+	return m.dividendYield(ticker), nil
 }
 
 // PayoutRatio holds the dividend payout ratio (percentage) for a symbol.
@@ -1605,25 +1374,11 @@ func describePayoutRatio(pct float64) string {
 
 // GetPayoutRatio returns the dividend payout ratio for a stock ticker. A zero ratio (no dividend) is valid, not an error.
 func (c *Client) GetPayoutRatio(ctx context.Context, ticker string) (*PayoutRatio, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		SummaryDetail struct {
-			PayoutRatio rawValue `json:"payoutRatio"`
-		} `json:"summaryDetail"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "summaryDetail", &out)
+	m, err := c.fetchModules(ctx, ticker, "summaryDetail")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	pct := out.SummaryDetail.PayoutRatio.Raw * 100
-	return &PayoutRatio{Symbol: ticker, Ratio: pct, Interpretation: describePayoutRatio(pct)}, nil
+	return m.payoutRatio(ticker), nil
 }
 
 // PayoutDate holds the next (or most recent) dividend payment date for a symbol.
@@ -1643,36 +1398,17 @@ func describePayoutDate(t time.Time) string {
 
 // GetPayoutDate returns the dividend payment date for a stock ticker. A missing date (no dividend) is valid, not an error.
 func (c *Client) GetPayoutDate(ctx context.Context, ticker string) (*PayoutDate, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
-	}
-	var out struct {
-		CalendarEvents struct {
-			DividendDate rawValue `json:"dividendDate"`
-		} `json:"calendarEvents"`
-	}
-	found, err := c.fetchQuoteSummary(ctx, ticker, "calendarEvents", &out)
+	m, err := c.fetchModules(ctx, ticker, "calendarEvents")
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, fmt.Errorf("%w: %s", ErrTickerNotFound, ticker)
-	}
-	var d time.Time
-	if raw := out.CalendarEvents.DividendDate.Raw; raw > 0 {
-		d = time.Unix(int64(raw), 0).UTC()
-	}
-	return &PayoutDate{Symbol: ticker, Date: d, Interpretation: describePayoutDate(d)}, nil
+	return m.payoutDate(ticker), nil
 }
 
 // GetMonthlyBar returns the OHLC data for a symbol in a given month. Forex pairs like "USD-EUR" are resolved automatically.
 func (c *Client) GetMonthlyBar(ctx context.Context, ticker string, year, month int) (*HistoricalBar, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
+	if err := c.ensureCrumb(ctx); err != nil {
+		return nil, err
 	}
 
 	bar, err := c.doGetMonthlyBar(ctx, ticker, year, month)
@@ -1699,17 +1435,49 @@ func (c *Client) GetMonthlyBar(ctx context.Context, ticker string, year, month i
 
 func (c *Client) doGetMonthlyBar(ctx context.Context, symbol string, year, month int) (*HistoricalBar, error) {
 	// Calculate period1 (first second of the month) and period2 (first second of next month)
-	period1 := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC).Unix()
-	period2 := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0).Unix()
+	start := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+	bars, err := c.fetchMonthlyOHLC(ctx, symbol, start, start.AddDate(0, 1, 0))
+	if err != nil || bars == nil {
+		return nil, err
+	}
 
+	open := bars.Open[0]
+	high := bars.High[0]
+	low := bars.Low[0]
+	closePrice := bars.Close[0]
+	avg := (open + high + low + closePrice) / 4
+
+	return &HistoricalBar{
+		Year:  year,
+		Month: month,
+		Open:  open,
+		High:  high,
+		Low:   low,
+		Close: closePrice,
+		Avg:   avg,
+	}, nil
+}
+
+// monthlyOHLC holds parallel per-month OHLC series from the chart endpoint.
+// Yahoo reports missing values as null, which decode to 0.
+type monthlyOHLC struct {
+	Open  []float64 `json:"open"`
+	High  []float64 `json:"high"`
+	Low   []float64 `json:"low"`
+	Close []float64 `json:"close"`
+}
+
+// fetchMonthlyOHLC fetches 1mo bars for symbol in [period1, period2) (requires crumb).
+// It returns nil, nil when Yahoo has no bars for the symbol.
+func (c *Client) fetchMonthlyOHLC(ctx context.Context, symbol string, period1, period2 time.Time) (*monthlyOHLC, error) {
 	u, err := url.Parse(fmt.Sprintf("%s/v7/finance/chart/%s", c.baseURL, symbol))
 	if err != nil {
 		return nil, fmt.Errorf("parsing url: %w", err)
 	}
 	q := u.Query()
 	q.Set("interval", "1mo")
-	q.Set("period1", fmt.Sprintf("%d", period1))
-	q.Set("period2", fmt.Sprintf("%d", period2))
+	q.Set("period1", fmt.Sprintf("%d", period1.Unix()))
+	q.Set("period2", fmt.Sprintf("%d", period2.Unix()))
 	q.Set("crumb", c.crumb)
 	u.RawQuery = q.Encode()
 
@@ -1717,7 +1485,7 @@ func (c *Client) doGetMonthlyBar(ctx context.Context, symbol string, year, month
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -1749,12 +1517,7 @@ func (c *Client) doGetMonthlyBar(ctx context.Context, symbol string, year, month
 		Chart struct {
 			Result []struct {
 				Indicators struct {
-					Quote []struct {
-						Open  []float64 `json:"open"`
-						High  []float64 `json:"high"`
-						Low   []float64 `json:"low"`
-						Close []float64 `json:"close"`
-					} `json:"quote"`
+					Quote []monthlyOHLC `json:"quote"`
 				} `json:"indicators"`
 			} `json:"result"`
 			Error interface{} `json:"error"`
@@ -1769,34 +1532,21 @@ func (c *Client) doGetMonthlyBar(ctx context.Context, symbol string, year, month
 		return nil, fmt.Errorf("%w: %v", ErrAPIError, payload.Chart.Error)
 	}
 
-	if len(payload.Chart.Result) == 0 || len(payload.Chart.Result[0].Indicators.Quote) == 0 || len(payload.Chart.Result[0].Indicators.Quote[0].Close) == 0 {
+	if len(payload.Chart.Result) == 0 || len(payload.Chart.Result[0].Indicators.Quote) == 0 {
 		return nil, nil
 	}
-
-	quote := payload.Chart.Result[0].Indicators.Quote[0]
-	open := quote.Open[0]
-	high := quote.High[0]
-	low := quote.Low[0]
-	closePrice := quote.Close[0]
-	avg := (open + high + low + closePrice) / 4
-
-	return &HistoricalBar{
-		Year:  year,
-		Month: month,
-		Open:  open,
-		High:  high,
-		Low:   low,
-		Close: closePrice,
-		Avg:   avg,
-	}, nil
+	bars := payload.Chart.Result[0].Indicators.Quote[0]
+	n := len(bars.Close)
+	if n == 0 || len(bars.Open) < n || len(bars.High) < n || len(bars.Low) < n {
+		return nil, nil
+	}
+	return &bars, nil
 }
 
-// GetYearlyBar returns yearly OHLC data by aggregating 4 quarters. Forex pairs like "USD-EUR" are resolved automatically.
+// GetYearlyBar returns yearly OHLC data by aggregating the year's monthly bars (one request). Forex pairs like "USD-EUR" are resolved automatically.
 func (c *Client) GetYearlyBar(ctx context.Context, ticker string, year int) (*YearlyBar, error) {
-	if c.crumb == "" {
-		if err := c.fetchCrumb(ctx); err != nil {
-			return nil, err
-		}
+	if err := c.ensureCrumb(ctx); err != nil {
+		return nil, err
 	}
 
 	bar, err := c.doGetYearlyBar(ctx, ticker, year)
@@ -1822,32 +1572,26 @@ func (c *Client) GetYearlyBar(ctx context.Context, ticker string, year int) (*Ye
 }
 
 func (c *Client) doGetYearlyBar(ctx context.Context, symbol string, year int) (*YearlyBar, error) {
-	// Fetch 4 quarters and aggregate
-	quarters := make([]*HistoricalBar, 4)
-	for q := 0; q < 4; q++ {
-		month := q*3 + 1
-		bar, err := c.doGetMonthlyBar(ctx, symbol, year, month)
-		if err != nil {
-			return nil, err
-		}
-		if bar == nil {
-			return nil, nil
-		}
-		quarters[q] = bar
+	start := time.Date(year, time.January, 1, 0, 0, 0, 0, time.UTC)
+	bars, err := c.fetchMonthlyOHLC(ctx, symbol, start, start.AddDate(1, 0, 0))
+	if err != nil || bars == nil {
+		return nil, err
 	}
 
-	// Aggregate: open from Q1, close from Q4, high/low from all
-	open := quarters[0].Open
-	closePrice := quarters[3].Close
-	high := quarters[0].High
-	low := quarters[0].Low
-
-	for _, q := range quarters {
-		if q.High > high {
-			high = q.High
+	// Aggregate across every month, skipping null (zero) values from missing bars.
+	var open, high, low, closePrice float64
+	for i := range bars.Close {
+		if open == 0 {
+			open = bars.Open[i]
 		}
-		if q.Low < low {
-			low = q.Low
+		if bars.High[i] > high {
+			high = bars.High[i]
+		}
+		if l := bars.Low[i]; l != 0 && (low == 0 || l < low) {
+			low = l
+		}
+		if bars.Close[i] != 0 {
+			closePrice = bars.Close[i]
 		}
 	}
 
@@ -1884,7 +1628,7 @@ func (c *Client) FetchMonthlyBar(ctx context.Context, symbol string, year, month
 	if err != nil {
 		return 0, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)
@@ -2041,7 +1785,7 @@ func (c *Client) fetchChartMeta(ctx context.Context, symbol string) (*chartRespo
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)
@@ -2173,7 +1917,7 @@ func (c *Client) fetchPriceHistory(ctx context.Context, symbol string) (*chartHi
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)

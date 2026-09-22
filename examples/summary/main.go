@@ -4,9 +4,8 @@
 // profit & operating margins, quarterly earnings & revenue growth, cash/debt/net,
 // dividend yield/payout ratio/payout date, 52-week range, and performance returns.
 //
-// Indicators are fetched concurrently. The crumb is warmed with a single sequential
-// call first, so the parallel fan-out only reads the (now-set) crumb — safe for
-// concurrent use — instead of racing to run the handshake many times at once.
+// Indicators are fetched concurrently. All quoteSummary-based indicators come from a
+// single GetFundamentals request; the client serialises the crumb handshake itself.
 package main
 
 import (
@@ -58,54 +57,17 @@ func main() {
 
 	ctx := context.Background()
 
-	// Warm the crumb with one sequential call before fanning out; this also gives the
-	// Price row. Every parallel call below then finds the crumb already set and only
-	// reads it, avoiding a data race on the lazy handshake.
-	quote, quoteErr := client.GetQuote(ctx, ticker)
-
 	var (
+		quote     *yahoo.Quote
+		quoteErr  error
+		fund      *yahoo.Fundamentals
+		fundErr   error
 		pe        *yahoo.PERatio
 		peErr     error
-		fcf       *yahoo.FreeCashFlow
-		fcfErr    error
-		cfq       *yahoo.CashFlowQuality
-		cfqErr    error
-		d2e       *yahoo.DebtToEquity
-		d2eErr    error
-		ev        *yahoo.EVToEBITDA
-		evErr     error
-		mc        *yahoo.MarketCap
-		mcErr     error
-		ps        *yahoo.PriceToSales
-		psErr     error
-		pb        *yahoo.PriceToBook
-		pbErr     error
-		fy        *yahoo.FreeCashFlowYield
-		fyErr     error
-		pm        *yahoo.ProfitMargin
-		pmErr     error
-		om        *yahoo.OperatingMargin
-		omErr     error
-		eg        *yahoo.QuarterlyEarningsGrowth
-		egErr     error
-		rg        *yahoo.QuarterlyRevenueGrowth
-		rgErr     error
-		cash      *yahoo.Cash
-		cashErr   error
-		debt      *yahoo.Debt
-		debtErr   error
-		dy        *yahoo.DividendYield
-		dyErr     error
-		prr       *yahoo.PayoutRatio
-		prErr     error
-		pd        *yahoo.PayoutDate
-		pdErr     error
 		rng       *yahoo.FiftyTwoWeekRange
 		rngErr    error
 		perf      *yahoo.PerformanceReturns
 		perfErr   error
-		sector    *yahoo.Sector
-		sectorErr error
 		bench     *yahoo.SectorBenchmark
 		benchErr  error
 		rating    *yahoo.AnalystRating
@@ -121,31 +83,37 @@ func main() {
 		}()
 	}
 
+	run(func() { quote, quoteErr = client.GetQuote(ctx, ticker) })
+	run(func() { fund, fundErr = client.GetFundamentals(ctx, ticker) })
 	run(func() { pe, peErr = client.GetPE(ctx, ticker) })
-	run(func() { fcf, fcfErr = client.GetFreeCashFlow(ctx, ticker) })
-	run(func() { cfq, cfqErr = client.GetOperatingCashFlowVsNetIncome(ctx, ticker) })
-	run(func() { d2e, d2eErr = client.GetDebtToEquity(ctx, ticker) })
-	run(func() { ev, evErr = client.GetEVToEBITDA(ctx, ticker) })
-	run(func() { mc, mcErr = client.GetMarketCap(ctx, ticker) })
-	run(func() { ps, psErr = client.GetPriceToSales(ctx, ticker) })
-	run(func() { pb, pbErr = client.GetPriceToBook(ctx, ticker) })
-	run(func() { fy, fyErr = client.GetFreeCashFlowYield(ctx, ticker) })
-	run(func() { pm, pmErr = client.GetProfitMargin(ctx, ticker) })
-	run(func() { om, omErr = client.GetOperatingMargin(ctx, ticker) })
-	run(func() { eg, egErr = client.GetQuarterlyEarningsGrowth(ctx, ticker) })
-	run(func() { rg, rgErr = client.GetQuarterlyRevenueGrowth(ctx, ticker) })
-	run(func() { cash, cashErr = client.GetCash(ctx, ticker) })
-	run(func() { debt, debtErr = client.GetDebt(ctx, ticker) })
-	run(func() { dy, dyErr = client.GetDividendYield(ctx, ticker) })
-	run(func() { prr, prErr = client.GetPayoutRatio(ctx, ticker) })
-	run(func() { pd, pdErr = client.GetPayoutDate(ctx, ticker) })
 	run(func() { rng, rngErr = client.FetchFiftyTwoWeekRange(ctx, ticker) })
 	run(func() { perf, perfErr = client.FetchPerformance(ctx, ticker) })
-	run(func() { sector, sectorErr = client.GetSector(ctx, ticker) })
 	run(func() { bench, benchErr = client.GetSectorBenchmark(ctx, ticker) })
 	run(func() { rating, ratingErr = client.GetAnalystRating(ctx, ticker) })
 
 	wg.Wait()
+
+	if fund == nil {
+		fund = &yahoo.Fundamentals{}
+	}
+	sector, sectorErr := fund.Sector, fundErr
+	fcf, fcfErr := fund.FreeCashFlow, fundErr
+	cfq, cfqErr := fund.CashFlowQuality, fundErr
+	d2e, d2eErr := fund.DebtToEquity, fundErr
+	ev, evErr := fund.EVToEBITDA, fundErr
+	mc, mcErr := fund.MarketCap, fundErr
+	ps, psErr := fund.PriceToSales, fundErr
+	pb, pbErr := fund.PriceToBook, fundErr
+	fy, fyErr := fund.FreeCashFlowYield, fundErr
+	pm, pmErr := fund.ProfitMargin, fundErr
+	om, omErr := fund.OperatingMargin, fundErr
+	eg, egErr := fund.QuarterlyEarningsGrowth, fundErr
+	rg, rgErr := fund.QuarterlyRevenueGrowth, fundErr
+	cash, cashErr := fund.Cash, fundErr
+	debt, debtErr := fund.Debt, fundErr
+	dy, dyErr := fund.DividendYield, fundErr
+	prr, prErr := fund.PayoutRatio, fundErr
+	pd, pdErr := fund.PayoutDate, fundErr
 
 	var rows []row
 

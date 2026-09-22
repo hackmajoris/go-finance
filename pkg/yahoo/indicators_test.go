@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -603,5 +604,156 @@ func assertMeta(t *testing.T, symbol, interpretation string) {
 	}
 	if interpretation == "" {
 		t.Error("interpretation: got empty string, want a non-empty explanation")
+	}
+}
+
+// Sector, PE and EV/EBITDA are independent lookups; running them one after another
+// put three round-trips on the critical path of every benchmark (and the summary CLI).
+func TestGetSectorBenchmark_FetchesIndependentInputsConcurrently(t *testing.T) {
+	const delay = 100 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		modules := r.URL.Query().Get("modules")
+		switch {
+		case r.URL.Path == "/v7/finance/quote":
+			time.Sleep(delay)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"quoteResponse": map[string]interface{}{
+					"result": []map[string]interface{}{{"symbol": "AAPL", "trailingPE": 20.0}},
+				},
+			})
+		case r.URL.Path == "/v10/finance/quoteSummary/AAPL" && modules == "assetProfile":
+			time.Sleep(delay)
+			_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+				"assetProfile": map[string]interface{}{"sector": "Technology"},
+			}))
+		case r.URL.Path == "/v10/finance/quoteSummary/AAPL" && modules == "defaultKeyStatistics":
+			time.Sleep(delay)
+			_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+				"defaultKeyStatistics": map[string]interface{}{"enterpriseToEbitda": raw(25)},
+			}))
+		case r.URL.Path == "/v1/finance/sectors/technology":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{"topCompanies": []map[string]interface{}{{"symbol": "PEER1"}}},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+				"summaryDetail":        map[string]interface{}{"marketCap": raw(1000)},
+				"defaultKeyStatistics": map[string]interface{}{"enterpriseValue": raw(1200), "netIncomeToCommon": raw(100)},
+				"financialData":        map[string]interface{}{"ebitda": raw(150)},
+			}))
+		}
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	if _, err := newTestClient(t, srv).GetSectorBenchmark(context.Background(), "AAPL"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 2*delay {
+		t.Errorf("took %v; sector/PE/EV lookups appear to run sequentially (want < %v)", elapsed, 2*delay)
+	}
+}
+
+// GetFundamentals exists so callers can swap ~18 requests for one; that is only safe if
+// every field matches what the single-indicator method would return for the same data.
+func TestGetFundamentals_MatchesSingleIndicatorMethods(t *testing.T) {
+	var batchedModules []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if m := r.URL.Query().Get("modules"); strings.Count(m, ",") > 1 {
+			batchedModules = append(batchedModules, m)
+		}
+		_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+			"financialData": map[string]interface{}{
+				"freeCashflow": raw(6e10), "operatingCashflow": raw(1.1e11), "debtToEquity": raw(150),
+				"profitMargins": raw(0.25), "operatingMargins": raw(0.3), "revenueGrowth": raw(0.08),
+				"totalCash": raw(6.5e10), "totalDebt": raw(1.1e11),
+			},
+			"defaultKeyStatistics": map[string]interface{}{
+				"netIncomeToCommon": raw(1e11), "enterpriseToEbitda": raw(22), "priceToBook": raw(45),
+				"earningsQuarterlyGrowth": raw(-0.05),
+			},
+			"summaryDetail": map[string]interface{}{
+				"marketCap": raw(3e12), "priceToSalesTrailing12Months": raw(8), "dividendYield": raw(0.005),
+				"payoutRatio": raw(0.15),
+			},
+			"calendarEvents": map[string]interface{}{"dividendDate": raw(1.7e9)},
+			"assetProfile":   map[string]interface{}{"sector": "Technology"},
+		}))
+	}))
+	defer srv.Close()
+
+	client := newTestClient(t, srv)
+	ctx := context.Background()
+	got, err := client.GetFundamentals(ctx, "AAPL")
+	if err != nil {
+		t.Fatalf("GetFundamentals: %v", err)
+	}
+	if len(batchedModules) != 1 {
+		t.Fatalf("batched requests: got %d, want 1", len(batchedModules))
+	}
+	for _, m := range []string{"financialData", "defaultKeyStatistics", "summaryDetail", "calendarEvents", "assetProfile"} {
+		if !strings.Contains(batchedModules[0], m) {
+			t.Errorf("batched request missing module %q: %q", m, batchedModules[0])
+		}
+	}
+
+	must := func(v interface{}, err error) interface{} {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("single-indicator call: %v", err)
+		}
+		return v
+	}
+	checks := []struct {
+		name   string
+		batch  interface{}
+		single interface{}
+	}{
+		{"Sector", got.Sector, must(client.GetSector(ctx, "AAPL"))},
+		{"FreeCashFlow", got.FreeCashFlow, must(client.GetFreeCashFlow(ctx, "AAPL"))},
+		{"CashFlowQuality", got.CashFlowQuality, must(client.GetOperatingCashFlowVsNetIncome(ctx, "AAPL"))},
+		{"DebtToEquity", got.DebtToEquity, must(client.GetDebtToEquity(ctx, "AAPL"))},
+		{"EVToEBITDA", got.EVToEBITDA, must(client.GetEVToEBITDA(ctx, "AAPL"))},
+		{"MarketCap", got.MarketCap, must(client.GetMarketCap(ctx, "AAPL"))},
+		{"PriceToSales", got.PriceToSales, must(client.GetPriceToSales(ctx, "AAPL"))},
+		{"PriceToBook", got.PriceToBook, must(client.GetPriceToBook(ctx, "AAPL"))},
+		{"FreeCashFlowYield", got.FreeCashFlowYield, must(client.GetFreeCashFlowYield(ctx, "AAPL"))},
+		{"ProfitMargin", got.ProfitMargin, must(client.GetProfitMargin(ctx, "AAPL"))},
+		{"OperatingMargin", got.OperatingMargin, must(client.GetOperatingMargin(ctx, "AAPL"))},
+		{"QuarterlyEarningsGrowth", got.QuarterlyEarningsGrowth, must(client.GetQuarterlyEarningsGrowth(ctx, "AAPL"))},
+		{"QuarterlyRevenueGrowth", got.QuarterlyRevenueGrowth, must(client.GetQuarterlyRevenueGrowth(ctx, "AAPL"))},
+		{"Cash", got.Cash, must(client.GetCash(ctx, "AAPL"))},
+		{"Debt", got.Debt, must(client.GetDebt(ctx, "AAPL"))},
+		{"DividendYield", got.DividendYield, must(client.GetDividendYield(ctx, "AAPL"))},
+		{"PayoutRatio", got.PayoutRatio, must(client.GetPayoutRatio(ctx, "AAPL"))},
+		{"PayoutDate", got.PayoutDate, must(client.GetPayoutDate(ctx, "AAPL"))},
+	}
+	for _, c := range checks {
+		if !reflect.DeepEqual(c.batch, c.single) {
+			t.Errorf("%s: batched %+v != single %+v", c.name, c.batch, c.single)
+		}
+	}
+	if got.CashFlowQuality.Ratio != 1.1 || got.MarketCap.MarketCap != 3e12 || got.Sector.Sector != "Technology" {
+		t.Errorf("fixture values not decoded: %+v %+v %+v", got.CashFlowQuality, got.MarketCap, got.Sector)
+	}
+}
+
+func TestGetFundamentals_Errors(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		wantErr error
+	}{
+		{"not found — 404", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) }, yahoo.ErrTickerNotFound},
+		{"not found — empty result", func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(emptySummary()) }, yahoo.ErrTickerNotFound},
+		{"http error status", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) }, yahoo.ErrAPIError},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+			_, err := newTestClient(t, srv).GetFundamentals(context.Background(), "AAPL")
+			checkErr(t, err, tc.wantErr)
+		})
 	}
 }

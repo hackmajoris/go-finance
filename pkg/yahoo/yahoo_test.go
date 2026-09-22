@@ -3,8 +3,12 @@ package yahoo_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1288,4 +1292,134 @@ func errIs(got, target error) bool {
 		got = u.Unwrap()
 	}
 	return false
+}
+
+// redirectTransport sends every request to srv, so tests exercising the crumb
+// handshake (whose consent URL is not configurable) never touch the network.
+type redirectTransport struct{ srv *httptest.Server }
+
+func (rt redirectTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	u, _ := url.Parse(rt.srv.URL)
+	r = r.Clone(r.Context())
+	r.URL.Scheme, r.URL.Host = u.Scheme, u.Host
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// newCrumblessClient is like newTestClient but starts without a crumb, forcing the handshake.
+func newCrumblessClient(t *testing.T, srv *httptest.Server) *yahoo.Client {
+	t.Helper()
+	client, err := yahoo.New(
+		yahoo.WithHTTPClient(&http.Client{Transport: redirectTransport{srv}}),
+		yahoo.WithBaseURL(srv.URL),
+		yahoo.WithCrumbURL(srv.URL+"/crumb"),
+	)
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	return client
+}
+
+// Concurrent callers on a fresh client must share one handshake: a stampede of
+// handshakes gets rate-limited by Yahoo, and unsynchronised writes to the crumb race.
+func TestCrumbHandshakeRunsOnceUnderConcurrency(t *testing.T) {
+	var crumbHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/crumb":
+			crumbHits.Add(1)
+			_, _ = w.Write([]byte("abc"))
+		case "/v10/finance/quoteSummary/AAPL":
+			if got := r.URL.Query().Get("crumb"); got != "abc" {
+				t.Errorf("crumb param: got %q, want %q", got, "abc")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"quoteSummary": map[string]interface{}{
+					"result": []map[string]interface{}{{"summaryDetail": map[string]interface{}{"marketCap": map[string]float64{"raw": 1e9}}}},
+				},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	client := newCrumblessClient(t, srv)
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := client.GetMarketCap(context.Background(), "AAPL"); err != nil {
+				t.Errorf("GetMarketCap: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if n := crumbHits.Load(); n != 1 {
+		t.Errorf("crumb endpoint hits: got %d, want 1", n)
+	}
+}
+
+// A transient handshake failure must not brick the client; the next call retries.
+func TestCrumbHandshakeRetriesAfterFailure(t *testing.T) {
+	var crumbHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/crumb":
+			if crumbHits.Add(1) == 1 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			_, _ = w.Write([]byte("abc"))
+		case "/v10/finance/quoteSummary/AAPL":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"quoteSummary": map[string]interface{}{
+					"result": []map[string]interface{}{{"summaryDetail": map[string]interface{}{"marketCap": map[string]float64{"raw": 1e9}}}},
+				},
+			})
+		}
+	}))
+	defer srv.Close()
+
+	client := newCrumblessClient(t, srv)
+	if _, err := client.GetMarketCap(context.Background(), "AAPL"); !errors.Is(err, yahoo.ErrAPIError) {
+		t.Fatalf("first call: got %v, want ErrAPIError", err)
+	}
+	if _, err := client.GetMarketCap(context.Background(), "AAPL"); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	if n := crumbHits.Load(); n != 2 {
+		t.Errorf("crumb endpoint hits: got %d, want 2", n)
+	}
+}
+
+// A yearly bar must reflect the whole year. Sampling only Jan/Apr/Jul/Oct misses
+// extremes in the other months and reports October's close as the year's close.
+func TestGetYearlyBar(t *testing.T) {
+	var chartHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chartHits.Add(1)
+		if got := r.URL.Query().Get("interval"); got != "1mo" {
+			t.Errorf("interval: got %q, want 1mo", got)
+		}
+		// Feb holds the year's high (200), Aug the low (50), Nov is a null bar, Dec close is 130.
+		_, _ = w.Write([]byte(`{"chart":{"result":[{"indicators":{"quote":[{
+			"open":  [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, null, 111],
+			"high":  [110, 200, 112, 113, 114, 115, 116, 117, 118, 119, null, 135],
+			"low":   [ 90,  91,  92,  93,  94,  95,  96,  50,  98,  99, null, 101],
+			"close": [105, 106, 107, 108, 109, 110, 111, 112, 113, 120, null, 130]
+		}]}}],"error":null}}`))
+	}))
+	defer srv.Close()
+
+	got, err := newTestClient(t, srv).GetYearlyBar(context.Background(), "AAPL", 2024)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := yahoo.YearlyBar{Symbol: "AAPL", Year: 2024, Open: 100, High: 200, Low: 50, Close: 130, Avg: (100 + 200 + 50 + 130) / 4.0}
+	if *got != want {
+		t.Errorf("got %+v, want %+v", *got, want)
+	}
+	if n := chartHits.Load(); n != 1 {
+		t.Errorf("chart requests: got %d, want 1", n)
+	}
 }
