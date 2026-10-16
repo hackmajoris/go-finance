@@ -19,6 +19,8 @@ import (
 	"sync"
 	"text/tabwriter"
 
+	"github.com/hackmajoris/go-finance/pkg/justetf"
+	"github.com/hackmajoris/go-finance/pkg/xetra"
 	"github.com/hackmajoris/go-finance/pkg/yahoo"
 )
 
@@ -108,6 +110,19 @@ func main() {
 		wg.Wait()
 	}
 
+	var (
+		jter    *justetf.ExpenseRatio
+		jterErr error
+	)
+	yahooHasTER := ter != nil && ter.TER != 0
+	if etf, ok := xetra.LookupYahoo(ticker); isETF && !yahooHasTER && ok {
+		jc, err := justetf.New()
+		if err != nil {
+			log.Fatal(err)
+		}
+		jter, jterErr = jc.GetTER(ctx, etf.ISIN)
+	}
+
 	if fund == nil {
 		fund = &yahoo.Fundamentals{}
 	}
@@ -153,6 +168,10 @@ func main() {
 
 	if isETF {
 		switch {
+		case jter != nil:
+			rows = append(rows, row{"TER", fmt.Sprintf("%.2f%%", jter.TER), "from justETF (ISIN " + jter.ISIN + ")"})
+		case jterErr != nil && !errors.Is(jterErr, justetf.ErrNotFound):
+			rows = append(rows, row{"TER", "error: " + jterErr.Error(), ""})
 		case errors.Is(terErr, yahoo.ErrTickerNotFound):
 			rows = append(rows, row{"TER", "—", "Yahoo has no fund data for this ticker"})
 		case terErr != nil:

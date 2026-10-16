@@ -1,4 +1,4 @@
-.PHONY: help test lint fmt generate summary release
+.PHONY: help test lint fmt generate etf-isins summary release
 
 .DEFAULT_GOAL := help
 
@@ -21,6 +21,9 @@ fmt: ## Format code with gofmt and goimports
 
 generate: ## Run go generate
 	go generate ./...
+
+etf-isins: ## Refresh the embedded Xetra ETF ticker→ISIN list from Deutsche Börse
+	go generate ./pkg/xetra
 
 # Usage: make summary TICKER=VWCE.DE
 TICKER ?= NVDA
