@@ -16,6 +16,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hackmajoris/go-finance/pkg/justetf"
+	"github.com/hackmajoris/go-finance/pkg/xetra"
 )
 
 var (
@@ -51,6 +54,7 @@ type Client struct {
 	crumbURL   string
 	crumbMu    sync.Mutex
 	crumb      string
+	justETF    *justetf.Client
 }
 
 // Quote holds the current price data returned for a single symbol.
@@ -93,7 +97,12 @@ func New(opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating cookie jar: %w", err)
 	}
+	jc, err := justetf.New()
+	if err != nil {
+		return nil, fmt.Errorf("creating justETF client: %w", err)
+	}
 	c := &Client{
+		justETF:    jc,
 		httpClient: &http.Client{Jar: jar},
 		baseURL:    defaultBaseURL,
 		v8BaseURL:  defaultV8BaseURL,
@@ -123,6 +132,11 @@ func WithCrumbURL(u string) Option {
 // WithV8BaseURL overrides the Yahoo Finance v8 chart endpoint base URL (useful for testing).
 func WithV8BaseURL(u string) Option {
 	return func(c *Client) { c.v8BaseURL = u }
+}
+
+// WithJustETF overrides the justETF client used as the TER fallback in GetExpenseRatio.
+func WithJustETF(jc *justetf.Client) Option {
+	return func(c *Client) { c.justETF = jc }
 }
 
 // WithCrumb injects a pre-fetched crumb, skipping the consent flow.
@@ -800,7 +814,11 @@ func (m *quoteSummaryModules) expenseRatio(ticker string) *ExpenseRatio {
 		v = m.DefaultKeyStatistics.AnnualReportExpenseRatio.Raw
 	}
 	pct := v * 100
-	return &ExpenseRatio{Symbol: ticker, TER: pct, Interpretation: describeExpenseRatio(pct)}
+	r := &ExpenseRatio{Symbol: ticker, TER: pct, Interpretation: describeExpenseRatio(pct)}
+	if pct != 0 {
+		r.Source = "Yahoo"
+	}
+	return r
 }
 
 func (m *quoteSummaryModules) topHoldings(ticker string) *TopHoldings {
@@ -930,7 +948,9 @@ func (c *Client) GetPriceToSales(ctx context.Context, ticker string) (*PriceToSa
 // ExpenseRatio holds a fund's total expense ratio (TER).
 type ExpenseRatio struct {
 	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
-	TER            float64 `json:"ter"`            // annual expense ratio as a percentage of assets (0.03 = 0.03%); 0 when Yahoo has none
+	TER            float64 `json:"ter"`            // annual expense ratio as a percentage of assets (0.03 = 0.03%); 0 when no source has it
+	Source         string  `json:"source"`         // where TER came from: "Yahoo", "justETF", or "" when TER is 0
+	ISIN           string  `json:"isin,omitempty"` // fund ISIN; set when TER came from justETF
 	Interpretation string  `json:"interpretation"` // plain-language read of the cost level
 }
 
@@ -948,12 +968,38 @@ func describeExpenseRatio(pct float64) string {
 }
 
 // GetExpenseRatio returns the total expense ratio (TER) for an ETF or fund ticker.
+// When Yahoo has no TER and the ticker is a Xetra listing (".DE"), the ISIN is looked
+// up in the embedded Xetra ETF list and the TER is read from justETF instead.
 func (c *Client) GetExpenseRatio(ctx context.Context, ticker string) (*ExpenseRatio, error) {
 	m, err := c.fetchModules(ctx, ticker, "fundProfile,defaultKeyStatistics")
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrTickerNotFound) {
 		return nil, err
 	}
-	return m.expenseRatio(ticker), nil
+	if err == nil {
+		if r := m.expenseRatio(ticker); r.TER != 0 {
+			return r, nil
+		}
+	}
+
+	etf, onXetra := xetra.LookupYahoo(ticker)
+	if !onXetra {
+		if err != nil {
+			return nil, err
+		}
+		return m.expenseRatio(ticker), nil
+	}
+	j, jerr := c.justETF.GetTER(ctx, etf.ISIN)
+	switch {
+	case jerr == nil:
+		return &ExpenseRatio{Symbol: ticker, TER: j.TER, Source: "justETF", ISIN: etf.ISIN, Interpretation: describeExpenseRatio(j.TER)}, nil
+	case errors.Is(jerr, justetf.ErrNotFound):
+		if err != nil {
+			return nil, err
+		}
+		return m.expenseRatio(ticker), nil
+	default:
+		return nil, fmt.Errorf("justETF fallback for %s: %w", etf.ISIN, jerr)
+	}
 }
 
 // Holding is one position inside a fund.

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hackmajoris/go-finance/pkg/justetf"
 	"github.com/hackmajoris/go-finance/pkg/yahoo"
 )
 
@@ -77,62 +78,121 @@ func TestGetMarketCap(t *testing.T) {
 	}
 }
 
+// justETFProfile is the TER row of a real justETF profile page (VWCE, 0.14%).
+const justETFProfile = `<tr data-testid="etf-basics_row_ter"><td class="vallabel">Total expense ratio</td><td><div class="val" data-testid="tl_etf-basics_value_ter">0.14% p.a.</div></td></tr>`
+
+// GetExpenseRatio is what callers (summary, brokers-sync watchlist) rely on for TER.
+// Yahoo leaves it empty for some funds (all Vanguard UCITS listings), so for Xetra
+// tickers it must fall back to justETF via the embedded ISIN list — and must not call
+// justETF when Yahoo already has the value or the ticker isn't a Xetra listing.
 func TestGetExpenseRatio(t *testing.T) {
+	yahooTER := func(v float64) interface{} {
+		return summaryResult(map[string]interface{}{
+			"fundProfile": map[string]interface{}{"feesExpensesInvestment": map[string]interface{}{"annualReportExpenseRatio": raw(v)}},
+		})
+	}
 	tests := []struct {
-		name    string
-		handler http.HandlerFunc
-		want    float64
-		wantErr error
+		name       string
+		ticker     string
+		yahoo      func(w http.ResponseWriter)
+		justETF    func(w http.ResponseWriter) // nil: justETF must not be called
+		wantTER    float64
+		wantSource string
+		wantISIN   string
+		wantErr    error
 	}{
 		{
-			name: "fund profile preferred over key statistics",
-			handler: func(w http.ResponseWriter, _ *http.Request) {
+			name:       "yahoo has TER — no fallback",
+			ticker:     "EUNL.DE",
+			yahoo:      func(w http.ResponseWriter) { _ = json.NewEncoder(w).Encode(yahooTER(0.002)) },
+			wantTER:    0.2,
+			wantSource: "Yahoo",
+		},
+		{
+			name:   "yahoo key statistics used when fund profile empty",
+			ticker: "SPY",
+			yahoo: func(w http.ResponseWriter) {
 				_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
-					"fundProfile":          map[string]interface{}{"feesExpensesInvestment": map[string]interface{}{"annualReportExpenseRatio": raw(0.0022)}},
-					"defaultKeyStatistics": map[string]interface{}{"annualReportExpenseRatio": raw(0.0099)},
+					"defaultKeyStatistics": map[string]interface{}{"annualReportExpenseRatio": raw(0.0009)},
 				}))
 			},
-			want: 0.22,
+			wantTER:    0.09,
+			wantSource: "Yahoo",
 		},
 		{
-			name: "falls back to key statistics",
-			handler: func(w http.ResponseWriter, _ *http.Request) {
-				_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
-					"defaultKeyStatistics": map[string]interface{}{"annualReportExpenseRatio": raw(0.0003)},
-				}))
-			},
-			want: 0.03,
+			name:       "yahoo empty, xetra ticker — TER from justETF",
+			ticker:     "VWCE.DE",
+			yahoo:      func(w http.ResponseWriter) { _ = json.NewEncoder(w).Encode(yahooTER(0)) },
+			justETF:    func(w http.ResponseWriter) { _, _ = w.Write([]byte(justETFProfile)) },
+			wantTER:    0.14,
+			wantSource: "justETF",
+			wantISIN:   "IE00BK5BQT80",
 		},
 		{
-			name: "no expense ratio reported",
-			handler: func(w http.ResponseWriter, _ *http.Request) {
-				_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{}))
-			},
-			want: 0,
+			name:       "yahoo has no fund data, xetra ticker — TER from justETF",
+			ticker:     "VWCE.DE",
+			yahoo:      func(w http.ResponseWriter) { _ = json.NewEncoder(w).Encode(emptySummary()) },
+			justETF:    func(w http.ResponseWriter) { _, _ = w.Write([]byte(justETFProfile)) },
+			wantTER:    0.14,
+			wantSource: "justETF",
+			wantISIN:   "IE00BK5BQT80",
 		},
 		{
-			name:    "not found — empty result",
-			handler: func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(emptySummary()) },
+			name:    "yahoo empty, not a xetra listing — 0 without fallback",
+			ticker:  "VWCE.AS",
+			yahoo:   func(w http.ResponseWriter) { _ = json.NewEncoder(w).Encode(yahooTER(0)) },
+			wantTER: 0,
+		},
+		{
+			name:    "yahoo empty, justETF has no profile — 0, not an error",
+			ticker:  "VWCE.DE",
+			yahoo:   func(w http.ResponseWriter) { _ = json.NewEncoder(w).Encode(yahooTER(0)) },
+			justETF: func(w http.ResponseWriter) { _, _ = w.Write([]byte(`<html>search</html>`)) },
+			wantTER: 0,
+		},
+		{
+			name:    "not found anywhere",
+			ticker:  "NOPE.AS",
+			yahoo:   func(w http.ResponseWriter) { _ = json.NewEncoder(w).Encode(emptySummary()) },
 			wantErr: yahoo.ErrTickerNotFound,
 		},
 		{
-			name:    "http error status",
-			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
+			// A failing fallback must surface, not silently report "no TER".
+			name:    "justETF error is returned",
+			ticker:  "VWCE.DE",
+			yahoo:   func(w http.ResponseWriter) { _ = json.NewEncoder(w).Encode(yahooTER(0)) },
+			justETF: func(w http.ResponseWriter) { w.WriteHeader(http.StatusServiceUnavailable) },
+			wantErr: justetf.ErrAPIError,
+		},
+		{
+			name:    "yahoo http error status",
+			ticker:  "VWCE.DE",
+			yahoo:   func(w http.ResponseWriter) { w.WriteHeader(http.StatusInternalServerError) },
 			wantErr: yahoo.ErrAPIError,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := httptest.NewServer(tc.handler)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/en/etf-profile.html" {
+					if tc.justETF == nil {
+						t.Errorf("justETF called unexpectedly: %s", r.URL)
+						return
+					}
+					tc.justETF(w)
+					return
+				}
+				tc.yahoo(w)
+			}))
 			defer srv.Close()
-			got, err := newTestClient(t, srv).GetExpenseRatio(context.Background(), "VWCE.DE")
+			got, err := newTestClient(t, srv).GetExpenseRatio(context.Background(), tc.ticker)
 			if !checkErr(t, err, tc.wantErr) {
 				return
 			}
-			if math.Abs(got.TER-tc.want) > 1e-9 {
-				t.Errorf("TER: got %f, want %f", got.TER, tc.want)
+			if math.Abs(got.TER-tc.wantTER) > 1e-9 || got.Source != tc.wantSource || got.ISIN != tc.wantISIN {
+				t.Errorf("got TER %v source %q isin %q, want %v %q %q", got.TER, got.Source, got.ISIN, tc.wantTER, tc.wantSource, tc.wantISIN)
 			}
-			if got.Symbol != "VWCE.DE" || got.Interpretation == "" {
+			if got.Symbol != tc.ticker || got.Interpretation == "" {
 				t.Errorf("meta: symbol %q, interpretation %q", got.Symbol, got.Interpretation)
 			}
 		})

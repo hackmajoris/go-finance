@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hackmajoris/go-finance/pkg/justetf"
 	"github.com/hackmajoris/go-finance/pkg/yahoo"
 )
 
@@ -30,10 +31,15 @@ func quotePayload(symbol string, price float64, currency string) interface{} {
 // so unit tests bypass the cookie/crumb dance entirely.
 func newTestClient(t *testing.T, srv *httptest.Server) *yahoo.Client {
 	t.Helper()
+	jc, err := justetf.New(justetf.WithBaseURL(srv.URL))
+	if err != nil {
+		t.Fatalf("justetf.New(): %v", err)
+	}
 	client, err := yahoo.New(
 		yahoo.WithBaseURL(srv.URL),
 		yahoo.WithCrumbURL(srv.URL+"/crumb"),
 		yahoo.WithCrumb("test-crumb"),
+		yahoo.WithJustETF(jc),
 	)
 	if err != nil {
 		t.Fatalf("New(): %v", err)
