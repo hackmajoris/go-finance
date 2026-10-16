@@ -149,6 +149,16 @@ func main() {
 			note = "financials reported in " + fund.Currency
 		}
 		rows = append(rows, row{"Currency", quote.Currency, note})
+
+		spreadNote := fmt.Sprintf("bid %.2f / ask %.2f", quote.Bid, quote.Ask)
+		if quote.MarketState != "REGULAR" {
+			spreadNote += " — market not in regular session, last quotes"
+		}
+		if quote.SpreadPct == 0 {
+			rows = append(rows, row{"Spread", "—", "no valid bid/ask quote"})
+		} else {
+			rows = append(rows, row{"Spread", fmt.Sprintf("%.2f %s (%.3f%%)", quote.Spread, quote.Currency, quote.SpreadPct), spreadNote})
+		}
 	}
 
 	if isETF {

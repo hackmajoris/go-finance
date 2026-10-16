@@ -63,6 +63,24 @@ type Quote struct {
 	Price     float64 `json:"price"`     // Regular market price
 	Currency  string  `json:"currency"`  // ISO 4217 currency code (e.g. "USD", "EUR")
 	QuoteType string  `json:"quoteType"` // Yahoo instrument type (e.g. "EQUITY", "ETF")
+
+	// Bid/ask snapshot. Outside trading hours these are the last quotes before close
+	// (see MarketState). Spread and SpreadPct are 0 when either side is missing or crossed.
+	Bid         float64 `json:"bid"`
+	Ask         float64 `json:"ask"`
+	Spread      float64 `json:"spread"`      // Ask - Bid, in Currency
+	SpreadPct   float64 `json:"spreadPct"`   // Spread as a percentage of the bid/ask midpoint (0.012 = 0.012%)
+	MarketState string  `json:"marketState"` // Yahoo session state: "REGULAR" while trading, otherwise e.g. "PRE", "POST", "CLOSED"
+}
+
+// newQuoteSpread computes the absolute and percentage bid/ask spread, returning zeros
+// when either side is missing or the book is crossed (ask below bid).
+func newQuoteSpread(bid, ask float64) (spread, pct float64) {
+	if bid <= 0 || ask <= 0 || ask < bid {
+		return 0, 0
+	}
+	spread = ask - bid
+	return spread, spread / ((ask + bid) / 2) * 100
 }
 
 // HistoricalBar holds OHLC price data for a single calendar month.
@@ -287,6 +305,9 @@ type v7QuoteResult struct {
 	RegularMarketPrice   float64 `json:"regularMarketPrice"`
 	Currency             string  `json:"currency"`
 	QuoteType            string  `json:"quoteType"`
+	Bid                  float64 `json:"bid"`
+	Ask                  float64 `json:"ask"`
+	MarketState          string  `json:"marketState"`
 	TrailingPE           float64 `json:"trailingPE"`
 	ForwardPE            float64 `json:"forwardPE"`
 	AverageAnalystRating string  `json:"averageAnalystRating"`
@@ -350,11 +371,17 @@ func (c *Client) doGetQuote(ctx context.Context, symbol string) (*Quote, error) 
 	if r == nil {
 		return nil, nil
 	}
+	spread, pct := newQuoteSpread(r.Bid, r.Ask)
 	return &Quote{
-		Symbol:    r.Symbol,
-		Price:     r.RegularMarketPrice,
-		Currency:  r.Currency,
-		QuoteType: r.QuoteType,
+		Symbol:      r.Symbol,
+		Price:       r.RegularMarketPrice,
+		Currency:    r.Currency,
+		QuoteType:   r.QuoteType,
+		Bid:         r.Bid,
+		Ask:         r.Ask,
+		Spread:      spread,
+		SpreadPct:   pct,
+		MarketState: r.MarketState,
 	}, nil
 }
 

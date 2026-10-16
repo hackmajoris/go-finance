@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -200,6 +201,51 @@ func TestGetQuote(t *testing.T) {
 			}
 			if quote.QuoteType != tc.wantType {
 				t.Errorf("quoteType: got %q, want %q", quote.QuoteType, tc.wantType)
+			}
+		})
+	}
+}
+
+// Spread is a trading-cost signal: a missing or crossed side must yield 0 (shown as
+// "—"), never a negative or meaningless spread that looks like a real cost.
+func TestGetQuote_Spread(t *testing.T) {
+	tests := []struct {
+		name       string
+		bid, ask   interface{} // nil: field absent from the payload
+		wantSpread float64
+		wantPct    float64
+	}{
+		{name: "normal spread", bid: 170.48, ask: 170.50, wantSpread: 0.02, wantPct: 0.02 / 170.49 * 100},
+		{name: "locked book", bid: 100.0, ask: 100.0, wantSpread: 0, wantPct: 0},
+		{name: "bid missing", bid: nil, ask: 170.50},
+		{name: "ask zero", bid: 170.48, ask: 0.0},
+		{name: "crossed book", bid: 170.50, ask: 170.48},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q := map[string]interface{}{"symbol": "VWCE.DE", "regularMarketPrice": 170.44, "currency": "EUR", "marketState": "POST"}
+			if tc.bid != nil {
+				q["bid"] = tc.bid
+			}
+			if tc.ask != nil {
+				q["ask"] = tc.ask
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"quoteResponse": map[string]interface{}{"result": []map[string]interface{}{q}, "error": nil},
+				})
+			}))
+			defer srv.Close()
+
+			got, err := newTestClient(t, srv).GetQuote(context.Background(), "VWCE.DE")
+			if err != nil {
+				t.Fatalf("GetQuote: %v", err)
+			}
+			if math.Abs(got.Spread-tc.wantSpread) > 1e-9 || math.Abs(got.SpreadPct-tc.wantPct) > 1e-9 {
+				t.Errorf("spread: got %v (%v%%), want %v (%v%%)", got.Spread, got.SpreadPct, tc.wantSpread, tc.wantPct)
+			}
+			if got.MarketState != "POST" {
+				t.Errorf("marketState: got %q, want POST", got.MarketState)
 			}
 		})
 	}
