@@ -5,6 +5,7 @@ github.com/hackmajoris/go-finance
 
 ## Structure
 - `pkg/` — all business logic; each package independently testable
+- `examples/<name>/main.go` — one small runnable demo per feature; no business logic, calls into `pkg/`
 
 ## Adding a New Package
 1. Create `pkg/<n>/`
@@ -22,4 +23,3 @@ github.com/hackmajoris/go-finance
 - Functional options: `type Option func(*Client)`
 - Sentinel errors: `var ErrNotFound = errors.New("not found")`
 - Wrap errors: `fmt.Errorf("doing X: %w", err)`
-- `main()` calls `run(args, out)` — keeps entry point testable

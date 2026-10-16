@@ -3,6 +3,7 @@ package yahoo_test
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -72,6 +73,132 @@ func TestGetMarketCap(t *testing.T) {
 				t.Errorf("marketCap: got %f, want %f", got.MarketCap, tc.want)
 			}
 			assertMeta(t, got.Symbol, got.Interpretation)
+		})
+	}
+}
+
+func TestGetExpenseRatio(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		want    float64
+		wantErr error
+	}{
+		{
+			name: "fund profile preferred over key statistics",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+					"fundProfile":          map[string]interface{}{"feesExpensesInvestment": map[string]interface{}{"annualReportExpenseRatio": raw(0.0022)}},
+					"defaultKeyStatistics": map[string]interface{}{"annualReportExpenseRatio": raw(0.0099)},
+				}))
+			},
+			want: 0.22,
+		},
+		{
+			name: "falls back to key statistics",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+					"defaultKeyStatistics": map[string]interface{}{"annualReportExpenseRatio": raw(0.0003)},
+				}))
+			},
+			want: 0.03,
+		},
+		{
+			name: "no expense ratio reported",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{}))
+			},
+			want: 0,
+		},
+		{
+			name:    "not found — empty result",
+			handler: func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(emptySummary()) },
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name:    "http error status",
+			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
+			wantErr: yahoo.ErrAPIError,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+			got, err := newTestClient(t, srv).GetExpenseRatio(context.Background(), "VWCE.DE")
+			if !checkErr(t, err, tc.wantErr) {
+				return
+			}
+			if math.Abs(got.TER-tc.want) > 1e-9 {
+				t.Errorf("TER: got %f, want %f", got.TER, tc.want)
+			}
+			if got.Symbol != "VWCE.DE" || got.Interpretation == "" {
+				t.Errorf("meta: symbol %q, interpretation %q", got.Symbol, got.Interpretation)
+			}
+		})
+	}
+}
+
+func TestGetTopHoldings(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		want    []yahoo.Holding
+		wantErr error
+	}{
+		{
+			// Order matters: the summary table lists holdings as ranked by Yahoo (largest first).
+			name: "weights as percentages, order preserved",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{
+					"topHoldings": map[string]interface{}{"holdings": []map[string]interface{}{
+						{"symbol": "NVDA", "holdingName": "NVIDIA Corp", "holdingPercent": raw(0.0808)},
+						{"symbol": "AAPL", "holdingName": "Apple Inc", "holdingPercent": raw(0.0703)},
+					}},
+				}))
+			},
+			want: []yahoo.Holding{
+				{Symbol: "NVDA", Name: "NVIDIA Corp", Weight: 8.08},
+				{Symbol: "AAPL", Name: "Apple Inc", Weight: 7.03},
+			},
+		},
+		{
+			name: "no holdings reported",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(summaryResult(map[string]interface{}{}))
+			},
+			want: []yahoo.Holding{},
+		},
+		{
+			name:    "not found — empty result",
+			handler: func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(emptySummary()) },
+			wantErr: yahoo.ErrTickerNotFound,
+		},
+		{
+			name:    "http error status",
+			handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
+			wantErr: yahoo.ErrAPIError,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+			got, err := newTestClient(t, srv).GetTopHoldings(context.Background(), "VOO")
+			if !checkErr(t, err, tc.wantErr) {
+				return
+			}
+			if got.Symbol != "VOO" {
+				t.Errorf("symbol: got %q, want %q", got.Symbol, "VOO")
+			}
+			if len(got.Holdings) != len(tc.want) {
+				t.Fatalf("holdings: got %d, want %d", len(got.Holdings), len(tc.want))
+			}
+			for i, h := range got.Holdings {
+				if h.Symbol != tc.want[i].Symbol || h.Name != tc.want[i].Name || math.Abs(h.Weight-tc.want[i].Weight) > 1e-9 {
+					t.Errorf("holding %d: got %+v, want %+v", i, h, tc.want[i])
+				}
+			}
 		})
 	}
 }
@@ -666,7 +793,7 @@ func TestGetFundamentals_MatchesSingleIndicatorMethods(t *testing.T) {
 			"financialData": map[string]interface{}{
 				"freeCashflow": raw(6e10), "operatingCashflow": raw(1.1e11), "debtToEquity": raw(150),
 				"profitMargins": raw(0.25), "operatingMargins": raw(0.3), "revenueGrowth": raw(0.08),
-				"totalCash": raw(6.5e10), "totalDebt": raw(1.1e11),
+				"totalCash": raw(6.5e10), "totalDebt": raw(1.1e11), "financialCurrency": "EUR",
 			},
 			"defaultKeyStatistics": map[string]interface{}{
 				"netIncomeToCommon": raw(1e11), "enterpriseToEbitda": raw(22), "priceToBook": raw(45),
@@ -732,6 +859,10 @@ func TestGetFundamentals_MatchesSingleIndicatorMethods(t *testing.T) {
 		if !reflect.DeepEqual(c.batch, c.single) {
 			t.Errorf("%s: batched %+v != single %+v", c.name, c.batch, c.single)
 		}
+	}
+	// Money values are labelled with this code; it must come from the reporting currency, not be assumed USD.
+	if got.Currency != "EUR" {
+		t.Errorf("currency: got %q, want %q", got.Currency, "EUR")
 	}
 	if got.CashFlowQuality.Ratio != 1.1 || got.MarketCap.MarketCap != 3e12 || got.Sector.Sector != "Technology" {
 		t.Errorf("fixture values not decoded: %+v %+v %+v", got.CashFlowQuality, got.MarketCap, got.Sector)

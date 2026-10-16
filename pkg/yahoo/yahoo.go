@@ -55,9 +55,10 @@ type Client struct {
 
 // Quote holds the current price data returned for a single symbol.
 type Quote struct {
-	Symbol   string  `json:"symbol"`   // Yahoo Finance ticker (e.g. "AAPL", "BTC-USD", "USD-EUR")
-	Price    float64 `json:"price"`    // Regular market price
-	Currency string  `json:"currency"` // ISO 4217 currency code (e.g. "USD", "EUR")
+	Symbol    string  `json:"symbol"`    // Yahoo Finance ticker (e.g. "AAPL", "BTC-USD", "USD-EUR")
+	Price     float64 `json:"price"`     // Regular market price
+	Currency  string  `json:"currency"`  // ISO 4217 currency code (e.g. "USD", "EUR")
+	QuoteType string  `json:"quoteType"` // Yahoo instrument type (e.g. "EQUITY", "ETF")
 }
 
 // HistoricalBar holds OHLC price data for a single calendar month.
@@ -271,6 +272,7 @@ type v7QuoteResult struct {
 	Symbol               string  `json:"symbol"`
 	RegularMarketPrice   float64 `json:"regularMarketPrice"`
 	Currency             string  `json:"currency"`
+	QuoteType            string  `json:"quoteType"`
 	TrailingPE           float64 `json:"trailingPE"`
 	ForwardPE            float64 `json:"forwardPE"`
 	AverageAnalystRating string  `json:"averageAnalystRating"`
@@ -335,9 +337,10 @@ func (c *Client) doGetQuote(ctx context.Context, symbol string) (*Quote, error) 
 		return nil, nil
 	}
 	return &Quote{
-		Symbol:   r.Symbol,
-		Price:    r.RegularMarketPrice,
-		Currency: r.Currency,
+		Symbol:    r.Symbol,
+		Price:     r.RegularMarketPrice,
+		Currency:  r.Currency,
+		QuoteType: r.QuoteType,
 	}, nil
 }
 
@@ -636,12 +639,14 @@ type quoteSummaryModules struct {
 		RevenueGrowth     rawValue `json:"revenueGrowth"`
 		TotalCash         rawValue `json:"totalCash"`
 		TotalDebt         rawValue `json:"totalDebt"`
+		FinancialCurrency string   `json:"financialCurrency"`
 	} `json:"financialData"`
 	DefaultKeyStatistics struct {
-		NetIncomeToCommon       rawValue `json:"netIncomeToCommon"`
-		EnterpriseToEbitda      rawValue `json:"enterpriseToEbitda"`
-		PriceToBook             rawValue `json:"priceToBook"`
-		EarningsQuarterlyGrowth rawValue `json:"earningsQuarterlyGrowth"`
+		NetIncomeToCommon        rawValue `json:"netIncomeToCommon"`
+		EnterpriseToEbitda       rawValue `json:"enterpriseToEbitda"`
+		PriceToBook              rawValue `json:"priceToBook"`
+		EarningsQuarterlyGrowth  rawValue `json:"earningsQuarterlyGrowth"`
+		AnnualReportExpenseRatio rawValue `json:"annualReportExpenseRatio"`
 	} `json:"defaultKeyStatistics"`
 	SummaryDetail struct {
 		MarketCap     rawValue `json:"marketCap"`
@@ -655,6 +660,18 @@ type quoteSummaryModules struct {
 	AssetProfile struct {
 		Sector string `json:"sector"`
 	} `json:"assetProfile"`
+	FundProfile struct {
+		FeesExpensesInvestment struct {
+			AnnualReportExpenseRatio rawValue `json:"annualReportExpenseRatio"`
+		} `json:"feesExpensesInvestment"`
+	} `json:"fundProfile"`
+	TopHoldings struct {
+		Holdings []struct {
+			Symbol         string   `json:"symbol"`
+			HoldingName    string   `json:"holdingName"`
+			HoldingPercent rawValue `json:"holdingPercent"`
+		} `json:"holdings"`
+	} `json:"topHoldings"`
 }
 
 // fetchModules ensures a crumb, fetches the given quoteSummary modules for ticker, and maps
@@ -777,10 +794,28 @@ func (m *quoteSummaryModules) payoutDate(ticker string) *PayoutDate {
 	return &PayoutDate{Symbol: ticker, Date: d, Interpretation: describePayoutDate(d)}
 }
 
+func (m *quoteSummaryModules) expenseRatio(ticker string) *ExpenseRatio {
+	v := m.FundProfile.FeesExpensesInvestment.AnnualReportExpenseRatio.Raw
+	if v == 0 {
+		v = m.DefaultKeyStatistics.AnnualReportExpenseRatio.Raw
+	}
+	pct := v * 100
+	return &ExpenseRatio{Symbol: ticker, TER: pct, Interpretation: describeExpenseRatio(pct)}
+}
+
+func (m *quoteSummaryModules) topHoldings(ticker string) *TopHoldings {
+	t := &TopHoldings{Symbol: ticker, Holdings: []Holding{}}
+	for _, h := range m.TopHoldings.Holdings {
+		t.Holdings = append(t.Holdings, Holding{Symbol: h.Symbol, Name: h.HoldingName, Weight: h.HoldingPercent.Raw * 100})
+	}
+	return t
+}
+
 // Fundamentals bundles every quoteSummary-based indicator for one symbol, fetched in a
 // single request. Each field equals what the matching single-indicator method returns.
 type Fundamentals struct {
 	Symbol                  string                   `json:"symbol"`
+	Currency                string                   `json:"currency"` // ISO 4217 code the financial statements are reported in; empty when Yahoo has none (e.g. ETFs)
 	Sector                  *Sector                  `json:"sector"`
 	FreeCashFlow            *FreeCashFlow            `json:"freeCashFlow"`
 	CashFlowQuality         *CashFlowQuality         `json:"cashFlowQuality"`
@@ -810,6 +845,7 @@ func (c *Client) GetFundamentals(ctx context.Context, ticker string) (*Fundament
 	}
 	return &Fundamentals{
 		Symbol:                  ticker,
+		Currency:                m.FinancialData.FinancialCurrency,
 		Sector:                  m.sector(ticker),
 		FreeCashFlow:            m.freeCashFlow(ticker),
 		CashFlowQuality:         m.cashFlowQuality(ticker),
@@ -889,6 +925,57 @@ func (c *Client) GetPriceToSales(ctx context.Context, ticker string) (*PriceToSa
 		return nil, err
 	}
 	return m.priceToSales(ticker), nil
+}
+
+// ExpenseRatio holds a fund's total expense ratio (TER).
+type ExpenseRatio struct {
+	Symbol         string  `json:"symbol"`         // Yahoo Finance ticker
+	TER            float64 `json:"ter"`            // annual expense ratio as a percentage of assets (0.03 = 0.03%); 0 when Yahoo has none
+	Interpretation string  `json:"interpretation"` // plain-language read of the cost level
+}
+
+func describeExpenseRatio(pct float64) string {
+	switch {
+	case pct <= 0:
+		return "No expense ratio reported."
+	case pct <= 0.2:
+		return "Low cost — typical of broad index funds."
+	case pct <= 0.5:
+		return "Moderate cost — common for regional, sector or factor funds."
+	default:
+		return "High cost — compare against cheaper funds tracking a similar index."
+	}
+}
+
+// GetExpenseRatio returns the total expense ratio (TER) for an ETF or fund ticker.
+func (c *Client) GetExpenseRatio(ctx context.Context, ticker string) (*ExpenseRatio, error) {
+	m, err := c.fetchModules(ctx, ticker, "fundProfile,defaultKeyStatistics")
+	if err != nil {
+		return nil, err
+	}
+	return m.expenseRatio(ticker), nil
+}
+
+// Holding is one position inside a fund.
+type Holding struct {
+	Symbol string  `json:"symbol"` // ticker of the held company (e.g. "NVDA")
+	Name   string  `json:"name"`   // company name
+	Weight float64 `json:"weight"` // share of fund assets as a percentage (8.08 = 8.08%)
+}
+
+// TopHoldings holds a fund's largest positions as reported by Yahoo (typically the top 10).
+type TopHoldings struct {
+	Symbol   string    `json:"symbol"`   // Yahoo Finance ticker of the fund
+	Holdings []Holding `json:"holdings"` // largest first; empty when Yahoo has none
+}
+
+// GetTopHoldings returns the largest positions held by an ETF or fund ticker.
+func (c *Client) GetTopHoldings(ctx context.Context, ticker string) (*TopHoldings, error) {
+	m, err := c.fetchModules(ctx, ticker, "topHoldings")
+	if err != nil {
+		return nil, err
+	}
+	return m.topHoldings(ticker), nil
 }
 
 // Sector holds a company's business sector classification (e.g. "Technology").

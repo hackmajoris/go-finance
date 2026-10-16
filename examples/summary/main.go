@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -27,20 +28,21 @@ type row struct {
 	note   string
 }
 
-// formatMoney scales a raw dollar amount to the nearest K/M/B/T suffix, e.g. 1.07721875456e+11 → "$107.72B".
-func formatMoney(v float64) string {
+// formatMoney scales a raw amount to the nearest K/M/B/T suffix and labels it with its
+// ISO currency code, e.g. (1.07721875456e+11, "EUR") → "107.72B EUR".
+func formatMoney(v float64, currency string) string {
 	abs := math.Abs(v)
 	switch {
 	case abs >= 1e12:
-		return fmt.Sprintf("$%.2fT", v/1e12)
+		return fmt.Sprintf("%.2fT %s", v/1e12, currency)
 	case abs >= 1e9:
-		return fmt.Sprintf("$%.2fB", v/1e9)
+		return fmt.Sprintf("%.2fB %s", v/1e9, currency)
 	case abs >= 1e6:
-		return fmt.Sprintf("$%.2fM", v/1e6)
+		return fmt.Sprintf("%.2fM %s", v/1e6, currency)
 	case abs >= 1e3:
-		return fmt.Sprintf("$%.2fK", v/1e3)
+		return fmt.Sprintf("%.2fK %s", v/1e3, currency)
 	default:
-		return fmt.Sprintf("$%.2f", v)
+		return fmt.Sprintf("%.2f %s", v, currency)
 	}
 }
 
@@ -93,8 +95,29 @@ func main() {
 
 	wg.Wait()
 
+	var (
+		ter        *yahoo.ExpenseRatio
+		terErr     error
+		holdings   *yahoo.TopHoldings
+		holdingErr error
+	)
+	isETF := quoteErr == nil && quote.QuoteType == "ETF"
+	if isETF {
+		run(func() { ter, terErr = client.GetExpenseRatio(ctx, ticker) })
+		run(func() { holdings, holdingErr = client.GetTopHoldings(ctx, ticker) })
+		wg.Wait()
+	}
+
 	if fund == nil {
 		fund = &yahoo.Fundamentals{}
+	}
+	var priceCcy string
+	if quoteErr == nil {
+		priceCcy = quote.Currency
+	}
+	ccy := fund.Currency
+	if ccy == "" {
+		ccy = priceCcy
 	}
 	sector, sectorErr := fund.Sector, fundErr
 	fcf, fcfErr := fund.FreeCashFlow, fundErr
@@ -121,6 +144,37 @@ func main() {
 		rows = append(rows, row{"Price", "error: " + quoteErr.Error(), ""})
 	} else {
 		rows = append(rows, row{"Price", fmt.Sprintf("%.2f %s", quote.Price, quote.Currency), ""})
+		note := ""
+		if fund.Currency != "" && fund.Currency != quote.Currency {
+			note = "financials reported in " + fund.Currency
+		}
+		rows = append(rows, row{"Currency", quote.Currency, note})
+	}
+
+	if isETF {
+		switch {
+		case errors.Is(terErr, yahoo.ErrTickerNotFound):
+			rows = append(rows, row{"TER", "—", "Yahoo has no fund data for this ticker"})
+		case terErr != nil:
+			rows = append(rows, row{"TER", "error: " + terErr.Error(), ""})
+		case ter.TER == 0:
+			rows = append(rows, row{"TER", "—", ter.Interpretation})
+		default:
+			rows = append(rows, row{"TER", fmt.Sprintf("%.2f%%", ter.TER), ter.Interpretation})
+		}
+
+		switch {
+		case errors.Is(holdingErr, yahoo.ErrTickerNotFound):
+			rows = append(rows, row{"Top Holdings", "—", "Yahoo has no fund data for this ticker"})
+		case holdingErr != nil:
+			rows = append(rows, row{"Top Holdings", "error: " + holdingErr.Error(), ""})
+		case len(holdings.Holdings) == 0:
+			rows = append(rows, row{"Top Holdings", "—", "No holdings reported."})
+		default:
+			for i, h := range holdings.Holdings {
+				rows = append(rows, row{fmt.Sprintf("Holding #%d", i+1), fmt.Sprintf("%s %.2f%%", h.Symbol, h.Weight), h.Name})
+			}
+		}
 	}
 
 	if sectorErr != nil {
@@ -159,14 +213,14 @@ func main() {
 	if fcfErr != nil {
 		rows = append(rows, row{"Free Cash Flow", "error: " + fcfErr.Error(), ""})
 	} else {
-		rows = append(rows, row{"Free Cash Flow", formatMoney(fcf.FCF), fcf.Interpretation})
+		rows = append(rows, row{"Free Cash Flow", formatMoney(fcf.FCF, ccy), fcf.Interpretation})
 	}
 
 	if cfqErr != nil {
 		rows = append(rows, row{"OCF / Net Income", "error: " + cfqErr.Error(), ""})
 	} else {
-		rows = append(rows, row{"Operating Cash Flow", formatMoney(cfq.OperatingCashFlow), ""})
-		rows = append(rows, row{"Net Income", formatMoney(cfq.NetIncome), ""})
+		rows = append(rows, row{"Operating Cash Flow", formatMoney(cfq.OperatingCashFlow, ccy), ""})
+		rows = append(rows, row{"Net Income", formatMoney(cfq.NetIncome, ccy), ""})
 		rows = append(rows, row{"OCF / Net Income", fmt.Sprintf("%.2fx", cfq.Ratio), cfq.Interpretation})
 	}
 
@@ -185,7 +239,7 @@ func main() {
 	if mcErr != nil {
 		rows = append(rows, row{"Market Cap", "error: " + mcErr.Error(), ""})
 	} else {
-		rows = append(rows, row{"Market Cap", formatMoney(mc.MarketCap), mc.Interpretation})
+		rows = append(rows, row{"Market Cap", formatMoney(mc.MarketCap, priceCcy), mc.Interpretation})
 	}
 
 	if psErr != nil {
@@ -233,12 +287,12 @@ func main() {
 	if cashErr != nil {
 		rows = append(rows, row{"Cash", "error: " + cashErr.Error(), ""})
 	} else {
-		rows = append(rows, row{"Cash", formatMoney(cash.Cash), cash.Interpretation})
+		rows = append(rows, row{"Cash", formatMoney(cash.Cash, ccy), cash.Interpretation})
 	}
 	if debtErr != nil {
 		rows = append(rows, row{"Debt", "error: " + debtErr.Error(), ""})
 	} else {
-		rows = append(rows, row{"Debt", formatMoney(debt.Debt), debt.Interpretation})
+		rows = append(rows, row{"Debt", formatMoney(debt.Debt, ccy), debt.Interpretation})
 	}
 	if cashErr == nil && debtErr == nil {
 		net := cash.Cash - debt.Debt
@@ -246,7 +300,7 @@ func main() {
 		if net < 0 {
 			note = "net debt position (debt exceeds cash)"
 		}
-		rows = append(rows, row{"Net", formatMoney(net), note})
+		rows = append(rows, row{"Net", formatMoney(net, ccy), note})
 	}
 
 	if dyErr != nil {

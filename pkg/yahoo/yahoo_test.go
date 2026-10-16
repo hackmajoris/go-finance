@@ -49,6 +49,7 @@ func TestGetQuote(t *testing.T) {
 		wantSymbol string
 		wantPrice  float64
 		wantCurr   string
+		wantType   string
 		wantErr    error
 		wantDecErr bool
 	}{
@@ -61,6 +62,25 @@ func TestGetQuote(t *testing.T) {
 			wantSymbol: "AAPL",
 			wantPrice:  189.43,
 			wantCurr:   "USD",
+		},
+		{
+			// The summary table shows ETF-only rows (TER) based on this field.
+			name: "etf quote type",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"quoteResponse": map[string]interface{}{
+						"result": []map[string]interface{}{
+							{"symbol": "VWCE.DE", "regularMarketPrice": 120.5, "currency": "EUR", "quoteType": "ETF"},
+						},
+						"error": nil,
+					},
+				})
+			},
+			ticker:     "VWCE.DE",
+			wantSymbol: "VWCE.DE",
+			wantPrice:  120.5,
+			wantCurr:   "EUR",
+			wantType:   "ETF",
 		},
 		{
 			name: "happy path crypto",
@@ -171,6 +191,9 @@ func TestGetQuote(t *testing.T) {
 			}
 			if quote.Currency != tc.wantCurr {
 				t.Errorf("currency: got %q, want %q", quote.Currency, tc.wantCurr)
+			}
+			if quote.QuoteType != tc.wantType {
+				t.Errorf("quoteType: got %q, want %q", quote.QuoteType, tc.wantType)
 			}
 		})
 	}
